@@ -66,6 +66,10 @@ Choose your capture region, adjust prompts, and enjoy the transformation.
 
 💡 Tip: Keep your model (e.g., SD-Turbo) next to the .exe for easy access.
 
+To build your own EXE file, make sure you install StreamDiffusion in your VENV
+
+https://github.com/cumulo-autumn/StreamDiffusion
+
 🔧Troubleshooting
 
 If for some reason Torch isn't being recognized by the app after clicking EnableGPU, cd into the  "_internal"  folder directory and download Torch with code (copy and paste it, it's one line) : pip install --target . --upgrade --no-deps torch==2.1.0+cu118 torchvision==0.16.0+cu118 --index-url https://download.pytorch.org/whl/cu118
