@@ -79,7 +79,10 @@ https://github.com/cumulo-autumn/StreamDiffusion
 
 🔧Troubleshooting
 
-If for some reason Torch isn't being recognized by the app after clicking EnableGPU, cd into the  "_internal"  folder directory and download Torch with code (copy and paste it, it's one line) : pip install --target . --upgrade --no-deps torch==2.1.0+cu118 torchvision==0.16.0+cu118 --index-url https://download.pytorch.org/whl/cu118
+If for some reason Torch isn't being recognized by the app after clicking EnableGPU, cd into the  "_internal"  folder directory and download Torch with code (copy and paste it, it's one line) : 
+
+pip install --target . --upgrade --no-deps torch==2.1.0+cu118 torchvision==0.16.0+cu118 --index-url https://download.pytorch.org/whl/cu118
+
 If you get an error about the model, try using the fp16 in the model folder that you downloaded, but rename them by removing the fp16 extension for all three unet/vae/text_encoder.
 
 Pull requests are welcome!  
