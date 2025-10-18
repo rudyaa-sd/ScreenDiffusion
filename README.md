@@ -24,15 +24,22 @@ It’s built for artists, developers, streamers, and visionaries who long to see
 
 
 🎁 Free to Use — Support/Tip If You Wish
+
 This project is completely free for everyone to use and explore.
 If Screen Diffusion inspires you, you can “pay what you want” or Tip on the itch page https://screendiffusion.itch.io/screen-diffusion-v01 — your support helps sustain development and future features:
 
 Higher resolution img2img.
+
 TensorRT support.
+
 Other model support including (SDXL-Turbo, SDXS)
+
 Controlnet and LoRA support
+
 More optimization for higher frame-rate.
+
 Custom GUI themes and auto-prompt presets.
+
 🙏 Every contribution, message, and prayer helps this project grow.
 
 🛠️ Prerequisites
