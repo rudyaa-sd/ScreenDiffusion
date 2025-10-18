@@ -49,19 +49,30 @@ Download SD-Turbo Model stored locally - (download link) https://huggingface.co/
 (Point the app to the folder that contains unet / vae/ textencoder...etc. This folder has to have a file called "model_index.json"
 
 📦 Installation
+
 Download the ZIP file from https://screendiffusion.itch.io/screen-diffusion-v01 and extract it anywhere on your computer.
+
 Open "ScreenDiffusion.exe"
+
 Click on "Enable GPU" button and wait for everything to download.
+
 Once download has finished the app is restarted automatically. 
+
 Point to your model folder path.
+
 Click Start.
+
 Choose your capture region, adjust prompts, and enjoy the transformation.
+
 💡 Tip: Keep your model (e.g., SD-Turbo) next to the .exe for easy access.
 
 🔧Troubleshooting
+
 If for some reason Torch isn't being recognized by the app after clicking EnableGPU, cd into the  "_internal"  folder directory and download Torch with code (copy and paste it, it's one line) : pip install --target . --upgrade --no-deps torch==2.1.0+cu118 torchvision==0.16.0+cu118 --index-url https://download.pytorch.org/whl/cu118
 If you get an error about the model, try using the fp16 in the model folder that you downloaded, but rename them by removing the fp16 extension for all three unet/vae/text_encoder.
+
 Pull requests are welcome!  
+
 Please open an issue first to discuss major changes.
 
 🌄 Closing Thought
