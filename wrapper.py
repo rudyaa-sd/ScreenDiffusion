@@ -12,6 +12,12 @@ from PIL import Image
 from streamdiffusion import StreamDiffusion
 from streamdiffusion.image_utils import postprocess_image
 
+from diffusers import AutoencoderTiny, StableDiffusionPipeline
+from PIL import Image
+
+from streamdiffusion import StreamDiffusion
+from streamdiffusion.image_utils import postprocess_image
+
 
 torch.set_grad_enabled(False)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -568,6 +574,8 @@ class StreamDiffusionWrapper:
         try:  # Load from local directory
             pipe: StableDiffusionPipeline = StableDiffusionPipeline.from_pretrained(
                 model_id_or_path,
+                variant="fp16",
+                use_safetensors=True,
             ).to(device=self.device, dtype=self.dtype)
 
         except ValueError:  # Load from huggingface
@@ -618,7 +626,8 @@ class StreamDiffusionWrapper:
 
         try:
             if acceleration == "xformers":
-                stream.pipe.enable_xformers_memory_efficient_attention()
+                print("[INFO] Bypassing broken xformers... Using PyTorch Native Flash Attention (SDPA) instead!")
+                # Modern diffusers natively default to SDPA on PyTorch 2.0+, so no extra code is needed here.
             if acceleration == "tensorrt":
                 from polygraphy import cuda
                 from streamdiffusion.acceleration.tensorrt import (

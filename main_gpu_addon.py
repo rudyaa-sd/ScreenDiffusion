@@ -30,18 +30,19 @@ from tkinter import filedialog, messagebox
 import tkinter as tk
 import venv
 import re
-RUNTIME_DIR = os.path.join(os.path.expanduser("~"), "AppData", "Local", "ScreenDiffusion", "runtime")
-PY_ENV = os.path.join(RUNTIME_DIR, "venv")
+RUNTIME_DIR = os.path.join(APP_ROOT, "venv")
+PY_ENV = RUNTIME_DIR
 _PIP_DL_PERCENT_RE = re.compile(r"Downloading\s+[^\n]*\s(\d{1,3})%")
 _PIP_LEGACY_BAR_RE = re.compile(r"\[\s*(\d{1,3})%\]")
 import shutil
 GPU_DIAGNOSTIC = True
 
-APP_DIR   = pathlib.Path(os.getenv("LOCALAPPDATA", os.getcwd())) / "ScreenDiffusion"
-RUNTIME   = APP_DIR / "runtime"
-PY_EXE    = RUNTIME / "Scripts" / "python.exe"
-PIP_EXE   = RUNTIME / "Scripts" / "pip.exe"
-BOOT_FLAG = "SD_RUNTIME_BOOTSTRAPPED"   
+APP_DIR       = APP_ROOT 
+RUNTIME       = APP_ROOT / "venv"
+PY_EXE        = RUNTIME / "Scripts" / "python.exe"
+PIP_EXE       = RUNTIME / "Scripts" / "pip.exe"
+SITE_PACKAGES = RUNTIME / "Lib" / "site-packages"
+BOOT_FLAG     = "SD_RUNTIME_BOOTSTRAPPED" 
 
 import ctypes
 import ctypes.wintypes as wint
@@ -69,31 +70,22 @@ SetLayeredWindowAttributes = _user32.SetLayeredWindowAttributes
 LWA_ALPHA         = 0x00000002
 
 if getattr(sys, "frozen", False):
-    tensorrt_dirs = [INTERNAL_DIR / "tensorrt", INTERNAL_DIR / "tensorrt_libs"]
-    for trt_dir in tensorrt_dirs:
-        if trt_dir.exists():
-            try:
-                os.add_dll_directory(str(trt_dir))
-                os.environ["PATH"] = str(trt_dir) + os.pathsep + os.environ.get("PATH", "")
-            except:
-                pass
-
-def _prime_dll_search():
-    import os, sys
-    from pathlib import Path
-    if os.name != "nt":
-        return
+        APP_ROOT_WORKER = Path(sys.executable).parent
+else:
+    APP_ROOT_WORKER = Path(__file__).resolve().parent
     
-    print("[DLL Search] Priming DLL search paths...")
+    APP_DIR_WORKER = Path(os.getenv("LOCALAPPDATA", os.getcwd())) / "ScreenDiffusion"
+    SITE_PACKAGES_WORKER = APP_DIR_WORKER / "runtime" / "Lib" / "site-packages"
     
-    dll_packages = [
-        "torch",
-        "tensorrt",
-        "xformers",
-    ]
+    internal_str = str(SITE_PACKAGES_WORKER)
+    if internal_str not in sys.path:
+        sys.path.insert(0, internal_str)
+        print(f"[Worker] Added to sys.path: {internal_str}")
+    
+    dll_packages = ["torch", "xformers"]
     
     for package in dll_packages:
-        pkg_dir = INTERNAL_DIR / package
+        pkg_dir = SITE_PACKAGES_WORKER / package
         if pkg_dir.exists():
             lib_dir = pkg_dir / "lib"
             if lib_dir.exists():
@@ -145,6 +137,66 @@ def try_import_dependency(name: str):
         return importlib.import_module("torch")
     except Exception:
         return None
+def _prime_dll_search():
+    import os, sys
+    from pathlib import Path
+    if os.name != "nt":
+        return
+    
+    print("[DLL Search] Priming DLL search paths...")
+    
+    dll_packages = [
+        "torch",
+        "tensorrt",
+        "xformers",
+    ]
+    
+    for package in dll_packages:
+        pkg_dir = SITE_PACKAGES / package
+        if pkg_dir.exists():
+            lib_dir = pkg_dir / "lib"
+            if lib_dir.exists():
+                print(f"[DLL Search] Found {package} lib: {lib_dir}")
+                try:
+                    os.add_dll_directory(str(lib_dir))
+                    print(f"[DLL Search] ✅ Added {package} lib to DLL directories")
+                except Exception as e:
+                    print(f"[DLL Search] ⚠ Error adding {package} lib: {e}")
+                
+                current_path = os.environ.get("PATH", "")
+                lib_str = str(lib_dir)
+                if lib_str not in current_path:
+                    os.environ["PATH"] = lib_str + os.pathsep + current_path
+            
+            if any(pkg_dir.glob("*.dll")):
+                print(f"[DLL Search] Found DLLs in {package} root: {pkg_dir}")
+                try:
+                    os.add_dll_directory(str(pkg_dir))
+                    print(f"[DLL Search] ✅ Added {package} root to DLL directories")
+                except Exception as e:
+                    print(f"[DLL Search] ⚠ Error adding {package} root: {e}")
+                
+                current_path = os.environ.get("PATH", "")
+                pkg_str = str(pkg_dir)
+                if pkg_str not in current_path:
+                    os.environ["PATH"] = pkg_str + os.pathsep + current_path
+        else:
+            print(f"[DLL Search] ⚠ {package} directory not found at: {pkg_dir}")
+    
+    possible_dll_dirs = [
+        SITE_PACKAGES / "bin",
+        SITE_PACKAGES / "Library" / "bin",
+    ]
+    
+    for dll_dir in possible_dll_dirs:
+        if dll_dir.exists():
+            try:
+                os.add_dll_directory(str(dll_dir))
+                print(f"[DLL Search] Added: {dll_dir}")
+            except Exception:
+                pass
+    
+    print("[DLL Search] DLL search path setup complete")
 
 class PreloadedDependencies:
     _torch = None
@@ -378,7 +430,6 @@ def maybe_bootstrap_gpu(on_progress=None, progress_callback=None):
             
             torch_cmd = [
                 *py_cmd, "-m", "pip", "install",
-                "--target", str(INTERNAL_DIR),
                 "--upgrade", 
                 "--no-deps",
                 "-vv",
@@ -856,9 +907,9 @@ def image_generation_process(
     else:
         APP_ROOT_WORKER = Path(__file__).resolve().parent
     
-    INTERNAL_DIR_WORKER = APP_ROOT_WORKER / "_internal"
+    SITE_PACKAGES_WORKER = APP_ROOT_WORKER / "venv" / "Lib" / "site-packages"
     
-    internal_str = str(INTERNAL_DIR_WORKER)
+    internal_str = str(SITE_PACKAGES_WORKER)
     if internal_str not in sys.path:
         sys.path.insert(0, internal_str)
         print(f"[Worker] Added to sys.path: {internal_str}")
@@ -866,7 +917,7 @@ def image_generation_process(
     dll_packages = ["torch", "xformers"]
     
     for package in dll_packages:
-        pkg_dir = INTERNAL_DIR_WORKER / package
+        pkg_dir = SITE_PACKAGES_WORKER / package
         if pkg_dir.exists():
             lib_dir = pkg_dir / "lib"
             if lib_dir.exists():
@@ -891,7 +942,8 @@ def image_generation_process(
                 if str(pkg_dir) not in current_path:
                     os.environ["PATH"] = str(pkg_dir) + os.pathsep + current_path
     
-    for bin_dir in [INTERNAL_DIR_WORKER / "bin", INTERNAL_DIR_WORKER / "Library" / "bin"]:
+    VENV_ROOT_WORKER = APP_ROOT_WORKER / "venv"
+    for bin_dir in [VENV_ROOT_WORKER / "Scripts", VENV_ROOT_WORKER / "Library" / "bin"]:
         if bin_dir.exists():
             try:
                 os.add_dll_directory(str(bin_dir))
@@ -1437,7 +1489,6 @@ def install_streamdiffusion(on_progress=None, skip_torch=True, progress_callback
     try:
         cmd = [
             *py_cmd, "-m", "pip", "install",
-            "--target", str(INTERNAL_DIR),
             "--no-deps",
             streamdiffusion_package,
         ]
@@ -1543,7 +1594,6 @@ class StreamGUI(ctk.CTk):
             
         self._build_ui()
         self._setup_input_validation()
-        self.after(500, self._check_and_hide_gpu_frame)
         self.bind("<Configure>", self._on_window_configure)
         self._poll_queues()
         self.protocol("WM_DELETE_WINDOW", self.do_quit)
@@ -1623,7 +1673,7 @@ class StreamGUI(ctk.CTk):
     def _show_download_dialog(self, model_path):
         dialog = ctk.CTkToplevel(self)
         dialog.title("Downloading sd-turbo fp16")
-        dialog.geometry("500x240")
+        dialog.geometry("600x400") # Made taller to fit the list
         dialog.transient(self)
         dialog.grab_set()
     
@@ -1645,29 +1695,63 @@ class StreamGUI(ctk.CTk):
         ctk.CTkLabel(
             dialog, 
             text=f"Destination: {model_path}",
-            wraplength=400
-        ).pack(pady=(0, 20))
-
-        progress_bar = ctk.CTkProgressBar(dialog, width=400)
-        progress_bar.pack(pady=(0, 10))
-        progress_bar.set(0)
+            wraplength=500
+        ).pack(pady=(0, 10))
 
         status_label = ctk.CTkLabel(dialog, text="Starting download...")
-        status_label.pack(pady=(0, 10))
+        status_label.pack(side="top", pady=(0, 10))
 
+        # Pack Cancel Button FIRST at the bottom so it never gets squished
         cancel_btn = ctk.CTkButton(
             dialog, 
             text="Cancel", 
             command=lambda: self._cancel_download(dialog, model_path)
         )
-        cancel_btn.pack(pady=(0, 10))
+        cancel_btn.pack(side="bottom", pady=(10, 20))
+
+        # Pack Scroll Frame in the remaining space
+        scroll_frame = ctk.CTkScrollableFrame(dialog, width=500, height=150)
+        scroll_frame.pack(side="top", fill="both", expand=True, padx=20, pady=(0, 10))
+
+        file_uis = {} # Dictionary to keep track of individual file UI elements
+
+        # Thread-safe UI updater function
+        def ui_updater(action, filename=None, progress=0.0, text=""):
+            if self._download_cancelled:
+                return
+            
+            if action == "global":
+                status_label.configure(text=text)
+            elif action == "update" and filename:
+                if filename not in file_uis:
+                    # Dynamically add a new row for a new file
+                    row_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+                    row_frame.pack(fill="x", pady=2)
+                    
+                    # Truncate long filenames so they fit nicely
+                    display_name = filename if len(filename) < 25 else filename[:22] + "..."
+                    
+                    lbl = ctk.CTkLabel(row_frame, text=f"{display_name}: 0%", width=220, anchor="w")
+                    lbl.pack(side="left", padx=(0, 10))
+                    
+                    bar = ctk.CTkProgressBar(row_frame, width=200)
+                    bar.pack(side="right", fill="x", expand=True)
+                    bar.set(0)
+                    
+                    file_uis[filename] = {'label': lbl, 'bar': bar, 'name': display_name}
+                
+                # Update the specific row
+                display_name = file_uis[filename]['name']
+                file_uis[filename]['label'].configure(text=f"{display_name}: {int(progress*100)}%")
+                file_uis[filename]['bar'].set(progress)
 
         self._current_download_dialog = dialog
         self._current_download_path = model_path
 
+        # Pass the ui_updater to the logic thread
         self._download_thread = threading.Thread(
             target=self._run_hf_download,
-            args=(model_path, progress_bar, status_label, dialog),
+            args=(model_path, ui_updater, dialog),
             daemon=True
         )
         self._download_thread.start()
@@ -1711,122 +1795,159 @@ class StreamGUI(ctk.CTk):
     
         print("Download cancelled successfully")
 
-    def _run_hf_download(self, model_path, progress_bar, status_label, dialog):
+    def _run_hf_download(self, model_path, ui_updater, dialog):
         try:
             model_repo = "stabilityai/sd-turbo"
     
-            def update_status(text, progress=0):
-                if self._download_cancelled:
-                    return False
+            def safe_ui_update(action, filename=None, progress=0.0, text=""):
+                if self._download_cancelled: return
                 try:
-                    self.after(0, lambda: status_label.configure(text=text))
-                    self.after(0, lambda: progress_bar.set(progress))
-                    return True
+                    # Force tkinter to run UI updates on the main thread
+                    self.after(0, lambda: ui_updater(action, filename, progress, text))
                 except Exception:
-                    return False
+                    pass
     
             def check_cancelled():
                 return self._download_cancelled
     
-            if not update_status("Checking Hugging Face CLI...", 0.1):
-                return
+            safe_ui_update("global", text="Checking Hugging Face CLI...")
     
-            if check_cancelled():
-                return
+            if check_cancelled(): return
     
             try:
-                subprocess.run(["huggingface-cli", "--version"], 
-                              capture_output=True, check=True, timeout=10)
+                subprocess.run(["huggingface-cli", "--version"], capture_output=True, check=True, timeout=10)
                 use_cli = True
-            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            except:
                 use_cli = False
     
             if not use_cli:
-                if not update_status("Installing huggingface_hub...", 0.2):
-                    return
-                if check_cancelled():
-                    return
+                safe_ui_update("global", text="Installing huggingface_hub...")
                 try:
-                    result = subprocess.run([
-                        sys.executable, "-m", "pip", "install", "huggingface_hub"
-                    ], check=True, capture_output=True, text=True, timeout=120)
-                    use_cli = True
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                    if not update_status(f"Installation failed: {e}", 0):
-                        return
+                    subprocess.run([sys.executable, "-m", "pip", "install", "huggingface_hub"], check=True, capture_output=True, timeout=120)
+                except Exception as e:
+                    safe_ui_update("global", text=f"Installation failed: {e}")
                     return
     
-            if not update_status("Starting download...", 0.3):
-                return
-        
-            if check_cancelled():
-                return
+            safe_ui_update("global", text="Starting download...")
+            if check_cancelled(): return
     
             os.makedirs(model_path, exist_ok=True)
-    
-            print("Starting CLI download with process control...")
         
             cmd = [
                 "huggingface-cli", "download", model_repo,
                 "--local-dir", model_path,
                 "--local-dir-use-symlinks", "False",
-                "--resume-download"
+                "--resume-download",
+                "--exclude", 
+                "sd_turbo.safetensors",                     
+                "unet/diffusion_pytorch_model.safetensors", 
+                "vae/diffusion_pytorch_model.safetensors",  
+                "text_encoder/model.safetensors"            
             ]
         
             self._download_process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
+                text=False,
+                bufsize=0
             )
         
             try:
-                last_progress = 0.3
+                buffer = bytearray()
+                tracked_urls = set()
                 while True:
                     if check_cancelled():
-                        print("Cancellation detected, terminating process...")
                         self._download_process.terminate()
                         import time
                         time.sleep(2)
                         if self._download_process.poll() is None:
-                            print("Process still running, killing...")
                             self._download_process.kill()
                         break
                 
-                    if self._download_process.poll() is not None:
-                        break
-                
-                    line = self._download_process.stdout.readline()
-                    if line:
-                        print(f"Download: {line.strip()}")
-                        if "%" in line:
-                            import re
-                            match = re.search(r'(\d+)%', line)
-                            if match:
-                                percent = int(match.group(1))
-                                progress = 0.3 + (percent / 100) * 0.7
-                                last_progress = progress
-                                if not update_status(f"Downloading... {percent}%", progress):
-                                    break
-                        else:
-                            if not update_status(f"Downloading...", last_progress):
-                                break
-                
-                    import time
-                    time.sleep(0.1)
+                    chunk = self._download_process.stdout.read(64)
+                    
+                    if not chunk:
+                        if self._download_process.poll() is not None:
+                            break
+                        import time
+                        time.sleep(0.01)
+                        continue
+                        
+                    buffer.extend(chunk)
+                    
+                    while b'\r' in buffer or b'\n' in buffer:
+                        r_idx = buffer.find(b'\r')
+                        n_idx = buffer.find(b'\n')
+                        
+                        idx = r_idx if r_idx != -1 and (n_idx == -1 or r_idx < n_idx) else n_idx
+                        line_bytes = buffer[:idx]
+                        buffer = buffer[idx + 1:]
+                        
+                        try:
+                            line = line_bytes.decode('utf-8', errors='replace').strip()
+                            if line:
+                                print(f"Download: {line}")
+                                
+                                # Global status for small files
+                                if "Fetching" in line and "%" in line:
+                                    import re
+                                    match = re.search(r'(\d+)%', line)
+                                    if match:
+                                        pct = int(match.group(1))
+                                        safe_ui_update("global", text=f"Fetching files... {pct}%")
+
+                                # File Watcher thread for concurrent downloads
+                                if "downloading https://" in line and ".incomplete" in line:
+                                    import re
+                                    match = re.search(r'downloading (https://\S+) to (.*\.incomplete)', line)
+                                    if match:
+                                        url = match.group(1)
+                                        filepath = match.group(2)
+                                        
+                                        # Only spawn one thread per unique URL
+                                        if url not in tracked_urls:
+                                            tracked_urls.add(url)
+                                            
+                                            # Grab parent folder + filename so it is completely unique (e.g., "unet/diffusion_pytorch_model.safetensors")
+                                            url_parts = url.split('/')
+                                            filename = f"{url_parts[-2]}/{url_parts[-1]}" if len(url_parts) >= 2 else url_parts[-1]
+                                            
+                                            def track_progress(dl_url, path, fname):
+                                                import time, os, urllib.request
+                                                try:
+                                                    req = urllib.request.Request(dl_url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
+                                                    with urllib.request.urlopen(req) as response:
+                                                        total_size = int(response.headers.get('Content-Length', 0))
+                                                    
+                                                    if total_size > 0:
+                                                        while not check_cancelled():
+                                                            if os.path.exists(path):
+                                                                current = os.path.getsize(path)
+                                                                percent = current / total_size
+                                                                safe_ui_update("update", filename=fname, progress=percent)
+                                                            else:
+                                                                # If file disappears, it finished and renamed itself!
+                                                                safe_ui_update("update", filename=fname, progress=1.0)
+                                                                break
+                                                            time.sleep(0.5) # Throttle UI updates
+                                                except Exception:
+                                                    pass
+                                            
+                                            import threading
+                                            threading.Thread(target=track_progress, args=(url, filepath, filename), daemon=True).start()
+                                        
+                        except Exception:
+                            pass
             
                 returncode = self._download_process.wait(timeout=5)
             
                 if check_cancelled():
-                    print("Download was cancelled successfully")
                     self._cleanup_partial_download(model_path)
                     return
                 
                 if returncode == 0:
-                    if not update_status("Download completed successfully!", 1.0):
-                        return
+                    safe_ui_update("global", text="Download completed successfully!")
                     self.after(0, lambda: self.model_var.set(model_path))
                     self.after(2000, dialog.destroy)
                     self.after(0, lambda: messagebox.showinfo(
@@ -1836,38 +1957,22 @@ class StreamGUI(ctk.CTk):
                 else:
                     if not check_cancelled():
                         error_msg = f"Download failed with exit code {returncode}"
-                        print(error_msg)
-                        if not update_status(error_msg, 0):
-                            return
+                        safe_ui_update("global", text=error_msg)
                     
             except Exception as e:
-                if not check_cancelled():
-                    error_msg = f"Download error: {str(e)}"
-                    print(error_msg)
-                    if not update_status(error_msg, 0):
-                        return
-                    
+                pass
             finally:
                 if self._download_process and self._download_process.poll() is None:
                     try:
                         self._download_process.terminate()
                         self._download_process.wait(timeout=2)
                     except:
-                        try:
-                            self._download_process.kill()
-                        except:
-                            pass
+                        try: self._download_process.kill()
+                        except: pass
                 self._download_process = None
                 
         except Exception as e:
-            if not self._download_cancelled:
-                error_msg = f"Download setup failed: {str(e)}"
-                print(error_msg)
-                try:
-                    self.after(0, lambda: status_label.configure(text=error_msg))
-                    self.after(0, lambda: progress_bar.set(0))
-                except Exception:
-                    pass
+            pass
 
     def _toggle_collapse(self):
         if self.collapse_var.get():
@@ -1970,16 +2075,16 @@ class StreamGUI(ctk.CTk):
             import sys
             import os
         
-            torch_dir = INTERNAL_DIR / "torch"
+            torch_dir = SITE_PACKAGES / "torch" 
             if not torch_dir.exists():
                 print(f"[GPU Check] Torch directory not found at: {torch_dir}")
                 return
         
             print(f"[GPU Check] Found torch directory: {torch_dir}")
         
-            internal_str = str(INTERNAL_DIR)
-            if internal_str not in sys.path:
-                sys.path.insert(0, internal_str)
+            site_packages_str = str(SITE_PACKAGES)
+            if site_packages_str not in sys.path:
+                sys.path.insert(0, site_packages_str)
         
             torch_lib_dir = torch_dir / "lib"
             if torch_lib_dir.exists():
@@ -2063,11 +2168,11 @@ class StreamGUI(ctk.CTk):
 
         self.version_label = ctk.CTkLabel(
             left_header,
-            text="Version 0.1",
+            text="Version 0.2 ",
             font=ctk.CTkFont(size=14, slant="italic"),
             text_color="gray70",
         )
-        self.version_label.grid(row=0, column=3, sticky="e")
+        self.version_label.grid(row=0, column=3, sticky="e", padx=(0, 4))
         self.header_frame = left_header
 
         left = ctk.CTkScrollableFrame(self, width=440, corner_radius=12)
@@ -2079,15 +2184,32 @@ class StreamGUI(ctk.CTk):
             ctk.CTkLabel(left, text="Model (diffusers folder):", anchor="w")\
                 .grid(row=row, column=0, sticky="ew", pady=(4, 0))
             mp = ctk.CTkFrame(left); mp.grid(row=row+1, column=0, sticky="ew")
+            
+            # Configure columns: 0 for entry (expands), 1 for Browse, 2 for Download
             mp.grid_columnconfigure(0, weight=1)
+            mp.grid_columnconfigure(1, weight=0)
+            mp.grid_columnconfigure(2, weight=0)
+            
             self._w_model_entry = ctk.CTkEntry(mp, textvariable=self.model_var)
             self._w_model_entry.grid(row=0, column=0, sticky="ew", padx=(0,6), pady=6)
+            
             self._w_model_browse = ctk.CTkButton(
-                mp, text="Browse", command=self._browse_model, width=90
+                mp, text="Browse", command=self._browse_model, width=70
             )
-            self._w_model_browse.grid(row=0, column=1, pady=6)
+            self._w_model_browse.grid(row=0, column=1, padx=(0,6), pady=6)
 
-            self._register_lockables(self._w_model_entry, self._w_model_browse)
+            # Add the new Download button hooked to your existing logic
+            self._w_model_download = ctk.CTkButton(
+                mp, 
+                text="⬇ Download SD-Turbo", 
+                command=self._download_sd_turbo, 
+                width=140,
+                fg_color="#10B981", # Success green from your CUSTOM_COLORS
+                hover_color="#059669"
+            )
+            self._w_model_download.grid(row=0, column=2, pady=6)
+
+            self._register_lockables(self._w_model_entry, self._w_model_browse, self._w_model_download)
             row += 2
 
         
@@ -2107,7 +2229,7 @@ class StreamGUI(ctk.CTk):
         if SHOW.get("acceleration", True):
             ctk.CTkLabel(g2, text="Acceleration").grid(row=0, column=col, sticky="w")
             self._w_accel_combo = ctk.CTkComboBox(
-                g2, values=["none","xformers"], variable=self.accel_var, width=120
+                g2, values=["none", "xformers", "tensorrt"], variable=self.accel_var, width=120
             )
             self._w_accel_combo.grid(row=1, column=col, sticky="ew"); col += 1
             self._register_lockables(self._w_accel_combo)
@@ -2164,17 +2286,7 @@ class StreamGUI(ctk.CTk):
             self._register_lockables(self._w_sim_switch, self._w_sim_thresh, self._w_sim_maxskip)
             row += 1
 
-        self.gpu_frame = ctk.CTkFrame(left)
-        self.gpu_frame.grid(row=row, column=0, sticky="ew", pady=(6,6))
-        self.gpu_frame.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(self.gpu_frame, text="GPU Add-On").grid(row=0, column=0, sticky="w")
-        self.gpu_btn = ctk.CTkButton(self.gpu_frame, text="Enable GPU (download ~ 2.8GB)", command=self._on_enable_gpu)
-        self.gpu_btn.grid(row=1, column=0, sticky="ew", pady=(4,2))
-        self.gpu_log = ctk.CTkTextbox(self.gpu_frame, height=80)
-        self.gpu_log.grid(row=2, column=0, sticky="ew")
-        self.gpu_log.configure(state="disabled")
-        self.gpu_log.configure(state="normal"); self.gpu_log.insert("end", "Log ready…\n"); self.gpu_log.configure(state="disabled")
-        row += 1
+        
 
         right = ctk.CTkFrame(self, corner_radius=12)
         right.grid(row=1, column=1, sticky="nsew", padx=(6, 12), pady=(6, 6))
