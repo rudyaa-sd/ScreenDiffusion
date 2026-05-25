@@ -1,7 +1,7 @@
 @echo off
-title ScreenDiffusion Setup
+title ScreenDiffusion Final Setup
 echo ========================================================
-echo        ScreenDiffusion Environment Setup
+echo        ScreenDiffusion Ultimate Environment Setup
 echo ========================================================
 echo.
 
@@ -31,10 +31,9 @@ python -m pip install --upgrade pip
 
 echo.
 echo [4/5] Installing PyTorch with universal CUDA support...
-echo Checking local caches to skip the massive download if possible...
 mkdir "%~dp0local_cache" 2>nul
 
-:: Check if the specific torch wheel physically exists in the local_cache folder
+:: Install PyTorch from local cache if available, otherwise download
 if exist "%~dp0local_cache\torch-2.7.0+cu128*.whl" (
     echo [INFO] Massive local PyTorch file detected! Installing completely offline...
     pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --no-index --find-links="%~dp0local_cache"
@@ -45,15 +44,19 @@ if exist "%~dp0local_cache\torch-2.7.0+cu128*.whl" (
 
 echo.
 echo [5/5] Installing strictly version-locked AI and UI dependencies...
-REM This locks the exact versions that play nicely together for StreamDiffusion and TensorRT
+REM Core AI framework
 pip install transformers==4.36.2 diffusers==0.24.0 huggingface-hub==0.22.2
 pip install streamdiffusion[tensorrt]
 
-REM Install the EXACT CUDA-enabled xformers version compatible with PyTorch 2.7.0+cu128
-pip install xformers==0.0.31 --no-deps --index-url https://download.pytorch.org/whl/cu128
+REM NVIDIA TensorRT compilation tools & CUDA bindings (Strictly pinned for RTX 50 Series)
+pip install tensorrt==10.8.0.43 tensorrt-cu12==10.8.0.43 polygraphy onnx onnx-graphsurgeon cuda-python==12.8.0 --extra-index-url https://pypi.ngc.nvidia.com
 
-REM Installing UI and capture dependencies (NumPy locked to prevent xformers crash)
+REM xformers skipped - RTX 50 series will natively use PyTorch SDPA (Flash Attention)
+:: pip install xformers (Intentionally removed to prevent build failures on cu128)
+
+REM UI, capture, and locked utility versions
 pip install customtkinter pillow numpy==1.26.4 dxcam mss opencv-python==4.10.0.84
+
 echo.
 echo ========================================================
 echo    Setup Complete! The environment is locked and stable.
@@ -62,7 +65,7 @@ pause
 exit /b
 
 :: ==========================================
-:: ERROR HANDLERS & EXITS
+:: ERROR HANDLERS
 :: ==========================================
 
 :python_error

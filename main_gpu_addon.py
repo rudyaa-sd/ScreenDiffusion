@@ -751,7 +751,8 @@ def _screen_capture_loop_dx(stop_evt: threading.Event,
     try:
         import dxcam
         camera = dxcam.create(output_idx=0, output_color="RGB")
-        camera.start(target_fps=30, video_mode=True)
+        # Do NOT call camera.start() here when the capture region can move.
+        # Newer DXcam expects region on start()/grab(); get_latest_frame() has no region argument.
     except Exception as e:
         print(f"dxcam failed, falling back to MSS: {e}")
         _screen_capture_loop_mss(stop_evt, height, width, region_ref, max_buffer, inputs_list)
@@ -775,7 +776,11 @@ def _screen_capture_loop_dx(stop_evt: threading.Event,
             W, H = int(rect["width"]), int(rect["height"])
             R, B = L + W, T + H
 
-            frame = camera.get_latest_frame(region=(L, T, R, B))
+            try:
+                frame = camera.grab(region=(L, T, R, B), new_frame_only=False)
+            except TypeError:
+                # Older DXcam builds do not have new_frame_only.
+                frame = camera.grab(region=(L, T, R, B))
             if frame is None:
                 time.sleep(0.001)
                 continue
