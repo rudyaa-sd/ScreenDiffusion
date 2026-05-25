@@ -1,37 +1,6 @@
-# -*- coding: utf-8 -*-
-"""
-GameDiffusion – GUI preview separate from floating capture window
-- Floating capture window: thick red border + draggable handle.
-  The 512×512 interior is a real hole via SetWindowRgn (never green).
-- Preview is rendered ONLY in the GUI (right panel). No overlay window.
-- Capture region tracks the floating window LIVE (no restart needed).
-- Works with dxcam (pref) and falls back to MSS (MSS may capture overlays).
-
-Patched to run WITHOUT Torch installed:
-- No top-level torch import (lazy import only).
-- Start button refuses to launch worker until Torch is available.
-"""
-
 import importlib.util, os, sys
-# ==== _internal GPU bootstrap (flat) ====
 from pathlib import Path
-APP_ROOT = (Path(sys.executable).parent if getattr(sys, "frozen", False)
-            else Path(__file__).resolve().parent)
-INTERNAL_DIR = APP_ROOT / "_internal"
-try:
-    INTERNAL_DIR.mkdir(parents=True, exist_ok=True)
-except Exception:
-    pass
-
-# ========================================
-
-import tempfile, time
-import queue
-import random
-import threading
-import pathlib
-
-import subprocess
+import tempfile, time, queue, random, threading, pathlib, subprocess, shutil, re
 from collections import deque
 from multiprocessing import get_context, Queue
 from multiprocessing.connection import Connection
@@ -44,22 +13,30 @@ from customtkinter import CTkImage
 from tkinter import filedialog, messagebox
 import tkinter as tk
 import venv
-import re
-RUNTIME_DIR = os.path.join(os.path.expanduser("~"), "AppData", "Local", "ScreenDiffusion", "runtime")
-PY_ENV = os.path.join(RUNTIME_DIR, "venv")
-_PIP_DL_PERCENT_RE = re.compile(r"Downloading\s+[^\n]*\s(\d{1,3})%")
-_PIP_LEGACY_BAR_RE = re.compile(r"\[\s*(\d{1,3})%\]")
-import shutil
-GPU_DIAGNOSTIC = True
-
-APP_DIR   = pathlib.Path(os.getenv("LOCALAPPDATA", os.getcwd())) / "ScreenDiffusion"
-RUNTIME   = APP_DIR / "runtime"
-PY_EXE    = RUNTIME / "Scripts" / "python.exe"
-PIP_EXE   = RUNTIME / "Scripts" / "pip.exe"
-BOOT_FLAG = "SD_RUNTIME_BOOTSTRAPPED"   
 
 import ctypes
 import ctypes.wintypes as wint
+
+APP_ROOT = (Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent)
+INTERNAL_DIR = APP_ROOT / "_internal"
+try:
+    INTERNAL_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+RUNTIME_DIR = os.path.join(APP_ROOT, "venv")
+PY_ENV = RUNTIME_DIR
+_PIP_DL_PERCENT_RE = re.compile(r"Downloading\s+[^\n]*\s(\d{1,3})%")
+_PIP_LEGACY_BAR_RE = re.compile(r"\[\s*(\d{1,3})%\]")
+GPU_DIAGNOSTIC = True
+
+APP_DIR = APP_ROOT 
+RUNTIME = APP_ROOT / "venv"
+PY_EXE = RUNTIME / "Scripts" / "python.exe"
+PIP_EXE = RUNTIME / "Scripts" / "pip.exe"
+SITE_PACKAGES = RUNTIME / "Lib" / "site-packages"
+BOOT_FLAG = "SD_RUNTIME_BOOTSTRAPPED" 
+
 _user32 = ctypes.windll.user32
 _gdi32  = ctypes.windll.gdi32
 
@@ -83,92 +60,48 @@ SetWindowLongW    = _user32.SetWindowLongW
 SetLayeredWindowAttributes = _user32.SetLayeredWindowAttributes
 LWA_ALPHA         = 0x00000002
 
-
-if getattr(sys, "frozen", False):
-    tensorrt_dirs = [INTERNAL_DIR / "tensorrt", INTERNAL_DIR / "tensorrt_libs"]
-    for trt_dir in tensorrt_dirs:
-        if trt_dir.exists():
-            try:
-                os.add_dll_directory(str(trt_dir))
-                os.environ["PATH"] = str(trt_dir) + os.pathsep + os.environ.get("PATH", "")
-            except:
-                pass
-
-
-
-
-def _prime_dll_search():
-    """Ensure Windows can find DLLs when importing from _internal."""
-    import os, sys
-    from pathlib import Path
+def _prime_dll_search(site_packages_path, internal_dir_path):
     if os.name != "nt":
         return
-    
-    print("[DLL Search] Priming DLL search paths...")
-    
-    # List of packages that have DLL directories
-    dll_packages = [
-        "torch",
-        "tensorrt",
-        #"tensorrt_libs",
-        #"onnxruntime",
-        "xformers",
-    ]
-    
-    # Add package lib directories
+    dll_packages = ["tensorrt", "xformers", "torch"]
     for package in dll_packages:
-        pkg_dir = INTERNAL_DIR / package
-        if pkg_dir.exists():
-            # Try lib subdirectory
-            lib_dir = pkg_dir / "lib"
-            if lib_dir.exists():
-                print(f"[DLL Search] Found {package} lib: {lib_dir}")
+        pkg_dir = site_packages_path / package
+        if not pkg_dir.exists():
+            continue
+        for target_dir in [pkg_dir / "lib", pkg_dir]:
+            if target_dir.exists():
                 try:
-                    os.add_dll_directory(str(lib_dir))
-                    print(f"[DLL Search] ✅ Added {package} lib to DLL directories")
-                except Exception as e:
-                    print(f"[DLL Search] ⚠ Error adding {package} lib: {e}")
-                
-                # Also add to PATH
+                    os.add_dll_directory(str(target_dir))
+                except Exception:
+                    pass
                 current_path = os.environ.get("PATH", "")
-                lib_str = str(lib_dir)
-                if lib_str not in current_path:
-                    os.environ["PATH"] = lib_str + os.pathsep + current_path
-            
-            # Also check package root directory for DLLs
-            if any(pkg_dir.glob("*.dll")):
-                print(f"[DLL Search] Found DLLs in {package} root: {pkg_dir}")
-                try:
-                    os.add_dll_directory(str(pkg_dir))
-                    print(f"[DLL Search] ✅ Added {package} root to DLL directories")
-                except Exception as e:
-                    print(f"[DLL Search] ⚠ Error adding {package} root: {e}")
-                
-                current_path = os.environ.get("PATH", "")
-                pkg_str = str(pkg_dir)
-                if pkg_str not in current_path:
-                    os.environ["PATH"] = pkg_str + os.pathsep + current_path
-        else:
-            print(f"[DLL Search] ⚠ {package} directory not found at: {pkg_dir}")
+                if str(target_dir) not in current_path:
+                    os.environ["PATH"] = str(target_dir) + os.pathsep + current_path
     
-    # Also check for other common DLL locations
-    possible_dll_dirs = [
-        INTERNAL_DIR / "bin",
-        INTERNAL_DIR / "Library" / "bin",
-    ]
-    
+    possible_dll_dirs = [site_packages_path / "bin", site_packages_path / "Library" / "bin", internal_dir_path / "bin", internal_dir_path / "Library" / "bin"]
     for dll_dir in possible_dll_dirs:
         if dll_dir.exists():
             try:
                 os.add_dll_directory(str(dll_dir))
-                print(f"[DLL Search] Added: {dll_dir}")
             except Exception:
                 pass
-    
-    print("[DLL Search] DLL search path setup complete")
+
+if getattr(sys, "frozen", False):
+    APP_ROOT_WORKER = Path(sys.executable).parent
+    SITE_PACKAGES_WORKER = SITE_PACKAGES
+else:
+    APP_ROOT_WORKER = Path(__file__).resolve().parent
+    APP_DIR_WORKER = Path(os.getenv("LOCALAPPDATA", os.getcwd())) / "ScreenDiffusion"
+    SITE_PACKAGES_WORKER = APP_DIR_WORKER / "runtime" / "Lib" / "site-packages"
+
+internal_str = str(SITE_PACKAGES_WORKER)
+if internal_str not in sys.path:
+    sys.path.insert(0, internal_str)
+
+_prime_dll_search(SITE_PACKAGES_WORKER, INTERNAL_DIR)
+_prime_dll_search(SITE_PACKAGES, INTERNAL_DIR)
 
 def try_import_dependency(name: str):
-    """Return torch module if present, else None (never raises at import-time)."""
     try:
         import importlib
         return importlib.import_module("torch")
@@ -187,10 +120,8 @@ class PreloadedDependencies:
     def get_torch(cls):
         if cls._torch is None:
             try:
-                _prime_dll_search()  # Set up DLL paths first
                 cls._torch = try_import_dependency("torch")
-            except Exception as e:
-                print(f"[Preload] Could not load torch: {e}")
+            except Exception:
                 cls._torch = None
         return cls._torch
     
@@ -223,74 +154,54 @@ class PreloadedDependencies:
     
     @classmethod
     def preload_all(cls):
-        """Preload all heavy dependencies in background"""
-        import threading
-        
         def background_preload():
-            cls.get_torch()  # Still try torch if available
-            cls.get_streamdiffusion()  # Try streamdiffusion
+            cls.get_torch()
+            cls.get_streamdiffusion()
             cls.get_numpy()
             cls.get_pil()
-        
         thread = threading.Thread(target=background_preload, daemon=True)
         thread.start()
         return thread
 
 if not getattr(sys, "frozen", False):
-    # Only preload in dev mode
     torch = PreloadedDependencies.get_torch()
 else:
-    # In frozen mode, torch will be loaded on-demand after DLL setup
     torch = None
 
 def _patch_torch_imports():
-    """Patch PyTorch imports to handle missing standard library modules in frozen environments."""
     import sys
     import types
-    
     if 'unittest.mock' not in sys.modules:
         try:
             import unittest.mock as mock
             sys.modules['unittest.mock'] = mock
         except ImportError:
             class MinimalMock:
-                def __init__(self, *args, **kwargs):
-                    pass
-                def __call__(self, *args, **kwargs):
-                    return self
-                def __getattr__(self, name):
-                    return self
-            
+                def __init__(self, *args, **kwargs): pass
+                def __call__(self, *args, **kwargs): return self
+                def __getattr__(self, name): return self
             mock_module = types.ModuleType('unittest.mock')
             mock_module.MagicMock = MinimalMock
             mock_module.Mock = MinimalMock
             mock_module.patch = MinimalMock
             mock_module.PropertyMock = MinimalMock
             mock_module.ANY = object()
-            
             sys.modules['unittest.mock'] = mock_module
+
 def resource_path(name: str) -> str:
-    """Return absolute path to a bundled resource (works in dev and PyInstaller)."""
-    if getattr(sys, "frozen", False):  # running as EXE
-        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))  # _internal for onedir
+    if getattr(sys, "frozen", False):
+        base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
         exe_dir = os.path.dirname(sys.executable)
-        candidates = [
-            os.path.join(base, name),                # e.g., _internal/logo.png
-            os.path.join(exe_dir, name),            # next to the EXE
-            os.path.join(base, "_internal", name),  # some builds place data here
-        ]
+        candidates = [os.path.join(base, name), os.path.join(exe_dir, name), os.path.join(base, "_internal", name)]
         for p in candidates:
             if os.path.exists(p):
                 return p
         return os.path.join(exe_dir, name)
-    # dev run
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), name)
 
 def _patch_missing_modules():
-    """Patch missing standard library modules in frozen environments."""
     import sys
     import types
-    
     if 'modulefinder' not in sys.modules:
         try:
             import modulefinder
@@ -302,54 +213,28 @@ def _patch_missing_modules():
 
 _patch_missing_modules()
 _patch_torch_imports()
-_prime_dll_search()
 
 def check_xformers_availability():
-    """Check if xformers is available and working - more tolerant version"""
     try:
         import xformers
         import xformers.ops
-        
-        # Test if xformers is actually working with a simple test
         try:
-            # Simple test that doesn't require specific hardware
             if hasattr(xformers.ops, 'memory_efficient_attention'):
                 return True, "xformers is available"
             else:
                 return False, "xformers installed but memory_efficient_attention not available"
         except Exception as e:
-            # xformers is installed but might have compatibility issues
             return False, f"xformers installed but has compatibility issues: {e}"
-            
     except ImportError:
         return False, "xformers not installed"
     except Exception as e:
         return False, f"xformers error: {e}"
 
-
 def verify_streamdiffusion_dependencies():
-    """Verify StreamDiffusion dependencies - more lenient version"""
-    dependencies = [
-        "streamdiffusion",
-        "PIL",  # Pillow
-        "numpy",
-    ]
-    
-    # These are important but we'll be more lenient
-    optional_deps = [
-        "torch",
-        "torchvision", 
-        "torchaudio",
-        "diffusers",
-        "transformers",
-        "cv2",  # opencv-python
-        "xformers",
-    ]
-    
+    dependencies = ["streamdiffusion", "PIL", "numpy"]
+    optional_deps = ["torch", "torchvision", "torchaudio", "diffusers", "transformers", "cv2", "xformers"]
     missing = []
     warnings = []
-    
-    # Check required dependencies
     for dep in dependencies:
         try:
             if dep == "PIL":
@@ -364,12 +249,10 @@ def verify_streamdiffusion_dependencies():
             missing.append(f"{dep}: {e}")
         except Exception as e:
             warnings.append(f"{dep}: loaded but has issues - {e}")
-    
-    # Check optional dependencies (don't add to missing)
     for dep in optional_deps:
         try:
             if dep == "PIL" or dep == "cv2":
-                continue  # Already checked
+                continue
             elif dep == "xformers":
                 xformers_available, xformers_msg = check_xformers_availability()
                 if not xformers_available:
@@ -380,137 +263,74 @@ def verify_streamdiffusion_dependencies():
             warnings.append(f"{dep}: not installed (optional)")
         except Exception as e:
             warnings.append(f"{dep}: loaded but has issues - {e}")
-    
     return missing, warnings
 
-
 def maybe_bootstrap_gpu(on_progress=None, progress_callback=None):
-    """Install ONLY PyTorch 2.1.0+cu118 and TorchVision 0.16.0+cu118. StreamDiffusion is bundled in EXE."""
-    
-    if on_progress:
-        on_progress("Checking for PyTorch 2.1.0+cu118...")
-    
-    # Check if correct PyTorch version with CUDA is already available
+    if on_progress: on_progress("Checking for PyTorch 2.1.0+cu118...")
     torch_available = False
     try:
         import torch
         import torchvision
-        
-        # Check for exact version
         torch_version = torch.__version__
-        if torch_version.startswith("2.1.0") and "+cu118" in torch_version:
+        if "+cu124" in torch_version:
             if torch.cuda.is_available():
-                if on_progress:
-                    on_progress(f"✅ PyTorch {torch_version} with CUDA already available!")
+                if on_progress: on_progress(f"PyTorch {torch_version} with CUDA already available!")
                 torch_available = True
                 return True
             else:
-                if on_progress:
-                    on_progress(f"⚠ PyTorch {torch_version} found but CUDA not available")
+                if on_progress: on_progress(f"PyTorch {torch_version} found but CUDA not available")
         else:
-            if on_progress:
-                on_progress(f"⚠ Found PyTorch {torch_version}, but need 2.1.0+cu118. Reinstalling...")
+            if on_progress: on_progress(f"Found PyTorch {torch_version}, but need 2.1.0+cu118. Reinstalling...")
     except ImportError:
-        if on_progress:
-            on_progress("PyTorch not found, starting installation...")
+        if on_progress: on_progress("PyTorch not found, starting installation...")
     except Exception as e:
-        if on_progress:
-            on_progress(f"⚠ PyTorch check error: {e}")
+        if on_progress: on_progress(f"PyTorch check error: {e}")
     
-    # Install specific PyTorch version if not available
     if not torch_available:
-        if on_progress:
-            on_progress("📦 Installing PyTorch 2.1.0+cu118 and TorchVision 0.16.0+cu118...")
-        
+        if on_progress: on_progress("Installing PyTorch 2.1.0+cu118 and TorchVision 0.16.0+cu118...")
         try:
             py_cmd = _python_cmd_for_pip()
-            
-            # Install specific versions of PyTorch and TorchVision with CUDA 11.8
-            torch_cmd = [
-                *py_cmd, "-m", "pip", "install",
-                "--target", str(INTERNAL_DIR),
-                "--upgrade",  # ← Added this!
-                "--no-deps",
-                "-vv",
-                "torch==2.1.0+cu118",
-                "torchvision==0.16.0+cu118",
-                "--index-url", "https://download.pytorch.org/whl/cu118"
-            ]
-            
-            if on_progress:
-                on_progress("⏬ Downloading PyTorch 2.1.0 and TorchVision 0.16.0 packages...")
-            
+            torch_cmd = [*py_cmd, "-m", "pip", "install", "--upgrade", "--no-deps", "-vv", "torch==2.5.1+cu124", "torchvision==0.20.1+cu124", "--index-url", "https://download.pytorch.org/whl/cu124"]
+            if on_progress: on_progress("Downloading PyTorch 2.1.0 and TorchVision 0.16.0 packages...")
             for line in _gpu_run(torch_cmd, on_progress=on_progress, no_window=not GPU_DIAGNOSTIC, progress_callback=progress_callback):
                 pass
-            
-            if on_progress:
-                on_progress("✅ PyTorch 2.1.0+cu118 installation complete!")
-            
-            # Verify installation
-            if on_progress:
-                on_progress("🔍 Verifying PyTorch installation...")
-            
+            if on_progress: on_progress("PyTorch 2.1.0+cu118 installation complete!")
+            if on_progress: on_progress("Verifying PyTorch installation...")
             try:
-                # Force reimport
                 import sys
-                if 'torch' in sys.modules:
-                    del sys.modules['torch']
-                if 'torchvision' in sys.modules:
-                    del sys.modules['torchvision']
-                
+                if 'torch' in sys.modules: del sys.modules['torch']
+                if 'torchvision' in sys.modules: del sys.modules['torchvision']
                 import torch
                 import torchvision
-                
                 torch_version = torch.__version__
                 torchvision_version = torchvision.__version__
                 cuda_available = torch.cuda.is_available()
-                
-                if on_progress:
-                    on_progress(f"Installed: PyTorch {torch_version}, TorchVision {torchvision_version}")
-                
+                if on_progress: on_progress(f"Installed: PyTorch {torch_version}, TorchVision {torchvision_version}")
                 if cuda_available:
-                    if on_progress:
-                        on_progress(f"✅ Verification successful! CUDA is available")
+                    if on_progress: on_progress(f"Verification successful! CUDA is available")
                     return True
                 else:
-                    if on_progress:
-                        on_progress("⚠ PyTorch installed but CUDA not available (may need GPU drivers)")
-                    return True  # Still return True, might be driver issue
-                    
+                    if on_progress: on_progress("PyTorch installed but CUDA not available (may need GPU drivers)")
+                    return True
             except Exception as e:
-                if on_progress:
-                    on_progress(f"❌ Verification failed: {e}")
+                if on_progress: on_progress(f"Verification failed: {e}")
                 return False
-            
         except Exception as e:
-            if on_progress:
-                on_progress(f"❌ PyTorch installation failed: {e}")
-            import traceback
-            if on_progress:
-                on_progress(f"Traceback: {traceback.format_exc()}")
+            if on_progress: on_progress(f"PyTorch installation failed: {e}")
             return False
-    
     return torch_available
-
 
 def _startup_probe(log_fn=None, logfile_name="ScreenDiffusion_probe.txt"):
     import sys, os
     from pathlib import Path
-
     log_path = Path(os.environ.get("LOCALAPPDATA", ".")) / logfile_name
-
     def p(msg: str):
         if callable(log_fn):
-            try:
-                log_fn(msg)
-            except Exception:
-                pass
+            try: log_fn(msg)
+            except Exception: pass
         try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(msg + "\n")
-        except Exception:
-            pass
-
+            with open(log_path, "a", encoding="utf-8") as f: f.write(msg + "\n")
+        except Exception: pass
     p("=== STARTUP PROBE ===")
     try:
         p(f"frozen? {getattr(sys, 'frozen', False)}")
@@ -519,23 +339,19 @@ def _startup_probe(log_fn=None, logfile_name="ScreenDiffusion_probe.txt"):
         p(f"PYTHONPATH: {os.environ.get('PYTHONPATH','')}")
         p(f"PATH[0:3]: {os.environ.get('PATH','').split(os.pathsep)[:3]}")
         p(f"sys.path[0:5]: {sys.path[:5]}")
-
         sp1 = RUNTIME / "Lib" / "site-packages"
         p(f"RUNTIME: {RUNTIME}  exists={RUNTIME.exists()}")
         p(f"site-packages: {sp1}  exists={sp1.exists()}  on_sys_path={str(sp1) in sys.path}")
-
         from pathlib import Path as _P
         if getattr(sys, "frozen", False):
             sp2 = _P(sys.executable).parent / "_internal" / "Lib" / "site-packages"
             p(f"_internal site-packages: {sp2}  exists={sp2.exists()}  on_sys_path={str(sp2) in sys.path}")
-
         try:
             import importlib
             t = importlib.import_module("torch")
             p(f"import torch (exe): OK v{t.__version__}")
         except Exception as e:
             p(f"import torch (exe): FAIL -> {e!r}")
-
         try:
             for line in _gpu_run([str(PY_EXE), "-c", "import torch,sys;print('VENV_TORCH',torch.__version__)"]):
                 p(f"[venv] {line}")
@@ -546,16 +362,13 @@ def _startup_probe(log_fn=None, logfile_name="ScreenDiffusion_probe.txt"):
 
 try:
     import os
-    if os.environ.get(BOOT_FLAG) == "1":
-        os.environ.pop(BOOT_FLAG, None)
+    if os.environ.get(BOOT_FLAG) == "1": os.environ.pop(BOOT_FLAG, None)
 except Exception:
     pass
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
-
 GD_DETERMINISTIC = bool(int(os.getenv('GD_DETERMINISTIC', '0')))
-
 LOCAL_MODEL_PATH = r""
 PREVIEW_GAIN = 1.15
 
@@ -570,39 +383,23 @@ def verify_local_model_path_dir(path: str):
         raise FileNotFoundError(f"Local model directory not found: {path}")
 
 def _frame_to_rgb(frame: np.ndarray, force_swap_rb: Optional[bool] = False) -> np.ndarray:
-    if frame is None or frame.size == 0:
-        return frame
-    if frame.shape[2] == 4:
-        frame = frame[:, :, :3]
-    if force_swap_rb:
-        frame = frame[:, :, ::-1]
+    if frame is None or frame.size == 0: return frame
+    if frame.shape[2] == 4: frame = frame[:, :, :3]
+    if force_swap_rb: frame = frame[:, :, ::-1]
     return frame
 
 SHOW = {
-    "model_path": True,
-    "prompt": True,
-    "negative_prompt": True,
-    "seed": True,
-    "frame_buffer_size": False,
-    "acceleration": True,
-    "use_denoising_batch": False,
-    "cfg_type": True,
-    "guidance_scale": True,
-    "delta": True,
-    "similar_image_filter": True,
+    "model_path": True, "prompt": True, "negative_prompt": True, "seed": True,
+    "frame_buffer_size": False, "acceleration": True, "use_denoising_batch": False,
+    "cfg_type": False, "guidance_scale": False, "delta": False, "similar_image_filter": False,
     "offline": False,
 }
 
-# =========================
-# Windows interop
-# =========================
 class RECT(ctypes.Structure):
-    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
 
 class MONITORINFO(ctypes.Structure):
-    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT),
-                ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
+    _fields_ = [("cbSize", ctypes.c_ulong), ("rcMonitor", RECT), ("rcWork", RECT), ("dwFlags", ctypes.c_ulong)]
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -616,98 +413,56 @@ def _monitor_rc_from_point(x: int, y: int):
     r = mi.rcMonitor
     return r.left, r.top, r.right, r.bottom
 
-# =========================
-# Floating capture window
-# =========================
-
 class FloatingCaptureWindow:
     def __init__(self, master: tk.Tk, inner_size=512, border_px=8, handle_h=28):
         self.master = master
         self.inner_size = int(inner_size)
         self.border_px = int(border_px)
         self.handle_h = int(handle_h)
-
         total_w = self.inner_size + self.border_px * 2
         total_h = self.handle_h + self.inner_size + self.border_px
-
         self.win = tk.Toplevel(master)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
-
         try:
             x0 = int(master.winfo_rootx()) + 50
             y0 = int(master.winfo_rooty()) + 50
         except Exception:
             x0, y0 = 200, 200
         self.win.geometry(f"{total_w}x{total_h}+{x0}+{y0}")
-
-        self.canvas = tk.Canvas(
-            self.win, width=total_w, height=total_h,
-            highlightthickness=0, bd=0, relief="flat"
-        )
+        self.canvas = tk.Canvas(self.win, width=total_w, height=total_h, highlightthickness=0, bd=0, relief="flat")
         self.canvas.pack(fill="both", expand=True)
-
         self.border_color = "#ef4444"
         self.handle_color = "#7f1d1d"
-
-        self.canvas.create_rectangle(
-            0, 0, total_w, self.handle_h,
-            fill=self.handle_color, outline=self.handle_color
-        )
-        self.canvas.create_text(
-            10, self.handle_h // 2, anchor="w",
-            text="Capture 512×512", fill="#ffffff", font=("Segoe UI", 9, "bold")
-        )
-        
-        self.canvas.create_rectangle(
-            0, self.handle_h, self.border_px, self.handle_h + self.inner_size + self.border_px,
-            fill=self.border_color, outline=self.border_color
-        )
-        self.canvas.create_rectangle(
-            self.border_px + self.inner_size, self.handle_h,
-            total_w, self.handle_h + self.inner_size + self.border_px,
-            fill=self.border_color, outline=self.border_color
-        )
-        self.canvas.create_rectangle(
-            0, self.handle_h + self.inner_size, total_w,
-            self.handle_h + self.inner_size + self.border_px,
-            fill=self.border_color, outline=self.border_color
-        )
-
+        self.canvas.create_rectangle(0, 0, total_w, self.handle_h, fill=self.handle_color, outline=self.handle_color)
+        self.canvas.create_text(10, self.handle_h // 2, anchor="w", text="Capture 512×512", fill="#ffffff", font=("Segoe UI", 9, "bold"))
+        self.canvas.create_rectangle(0, self.handle_h, self.border_px, self.handle_h + self.inner_size + self.border_px, fill=self.border_color, outline=self.border_color)
+        self.canvas.create_rectangle(self.border_px + self.inner_size, self.handle_h, total_w, self.handle_h + self.inner_size + self.border_px, fill=self.border_color, outline=self.border_color)
+        self.canvas.create_rectangle(0, self.handle_h + self.inner_size, total_w, self.handle_h + self.inner_size + self.border_px, fill=self.border_color, outline=self.border_color)
         self._apply_window_region(total_w, total_h)
-
         self._drag_start = None
         self.canvas.bind("<Button-1>", self._on_mouse_down)
         self.canvas.bind("<B1-Motion>", self._on_mouse_drag)
-
         try:
             hwnd = int(self.win.winfo_id())
             ex = GetWindowLongW(hwnd, GWL_EXSTYLE)
-            # NO WS_EX_TRANSPARENT - SetWindowRgn handles the hole
             SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED | WS_EX_TOOLWINDOW)
             SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA)
-        except Exception as e:
-            print(f"[capwin] style setup failed: {e}")
+        except Exception:
+            pass
 
     def _apply_window_region(self, total_w: int, total_h: int):
         try:
             region = CreateRectRgn(0, 0, total_w, self.handle_h)
-
-            left = CreateRectRgn(0, self.handle_h, self.border_px,
-                                 self.handle_h + self.inner_size + self.border_px)
+            left = CreateRectRgn(0, self.handle_h, self.border_px, self.handle_h + self.inner_size + self.border_px)
             CombineRgn(region, region, left, RGN_OR); DeleteObject(left)
-
-            right = CreateRectRgn(self.border_px + self.inner_size, self.handle_h,
-                                  total_w, self.handle_h + self.inner_size + self.border_px)
+            right = CreateRectRgn(self.border_px + self.inner_size, self.handle_h, total_w, self.handle_h + self.inner_size + self.border_px)
             CombineRgn(region, region, right, RGN_OR); DeleteObject(right)
-
-            bottom = CreateRectRgn(0, self.handle_h + self.inner_size, total_w,
-                                   self.handle_h + self.inner_size + self.border_px)
+            bottom = CreateRectRgn(0, self.handle_h + self.inner_size, total_w, self.handle_h + self.inner_size + self.border_px)
             CombineRgn(region, region, bottom, RGN_OR); DeleteObject(bottom)
-
             SetWindowRgn(self.win.winfo_id(), region, True)
-        except Exception as e:
-            print(f"[capwin] region failed: {e}")
+        except Exception:
+            pass
 
     def _on_mouse_down(self, evt):
         if 0 <= evt.y <= self.handle_h:
@@ -736,39 +491,24 @@ class FloatingCaptureWindow:
         y = int(self.win.winfo_rooty()) + self.handle_h
         return {"left": x, "top": y, "width": self.inner_size, "height": self.inner_size}
 
-# =========================
-# Capture loops
-# =========================
-def _screen_capture_loop_dx(stop_evt: threading.Event,
-                            height: int, width: int,
-                            region_ref: Dict[str, Dict[str, int]],
-                            max_buffer: int,
-                            inputs_list: List[Any]):
-    """Optimized DXGI screen-capture loop with pinned CPU staging + load shedding."""
+def _screen_capture_loop_dx(stop_evt: threading.Event, height: int, width: int, region_ref: Dict[str, Dict[str, int]], max_buffer: int, inputs_list: List[Any]):
     torch = PreloadedDependencies.get_torch()
-    if torch is None:
-        return
+    if torch is None: return
 
     def _append_shed(q, item, maxlen):
-        """Append with shedding: drop oldest if the consumer is behind."""
         try:
             if hasattr(q, "maxlen") and q.maxlen is not None:
-                if len(q) >= q.maxlen:
-                    q.popleft()
+                if len(q) >= q.maxlen: q.popleft()
                 q.append(item)
             else:
-                while len(q) >= maxlen:
-                    q.pop(0)
+                while len(q) >= maxlen: q.pop(0)
                 q.append(item)
-        except Exception:
-            pass
+        except Exception: pass
 
     try:
         import dxcam
         camera = dxcam.create(output_idx=0, output_color="RGB")
-        camera.start(target_fps=30, video_mode=True)
-    except Exception as e:
-        print(f"dxcam failed, falling back to MSS: {e}")
+    except Exception:
         _screen_capture_loop_mss(stop_evt, height, width, region_ref, max_buffer, inputs_list)
         return
 
@@ -776,10 +516,8 @@ def _screen_capture_loop_dx(stop_evt: threading.Event,
     H_t, W_t = int(height), int(width)
     C = 3
     dtype_cpu = torch.uint8
-
     staging_cpu = None
     need_resize = None
-
     frame_count = 0
     last_log_time = time.time()
 
@@ -789,370 +527,180 @@ def _screen_capture_loop_dx(stop_evt: threading.Event,
             L, T = int(rect["left"]), int(rect["top"])
             W, H = int(rect["width"]), int(rect["height"])
             R, B = L + W, T + H
-
-            frame = camera.get_latest_frame(region=(L, T, R, B))
+            try:
+                frame = camera.grab(region=(L, T, R, B), new_frame_only=False)
+            except TypeError:
+                frame = camera.grab(region=(L, T, R, B))
             if frame is None:
                 time.sleep(0.001)
                 continue
-
             if frame.shape[-1] == 4:
                 frame = frame[..., :3]
-
             if staging_cpu is None:
                 H_c, W_c = int(frame.shape[0]), int(frame.shape[1])
                 staging_cpu = torch.empty((H_c, W_c, C), dtype=dtype_cpu, pin_memory=True)
                 need_resize = (H_c != H_t) or (W_c != W_t)
-
             staging_cpu.numpy()[...] = frame
-
             img = staging_cpu.to(device=device, dtype=torch.float32, non_blocking=True)
             img = img.permute(2, 0, 1).unsqueeze(0)
             img.mul_(1.0 / 255.0)
-
             if need_resize:
-                img = torch.nn.functional.interpolate(
-                    img, size=(H_t, W_t), mode="bilinear", align_corners=False
-                )
-
+                img = torch.nn.functional.interpolate(img, size=(H_t, W_t), mode="bilinear", align_corners=False)
             _append_shed(inputs_list, img, max_buffer)
-
             frame_count += 1
             now = time.time()
             if now - last_log_time > 5.0:
                 fps = frame_count / (now - last_log_time)
-                try:
-                    buf_len = len(inputs_list)
-                except Exception:
-                    buf_len = -1
-                print(f"Capture FPS: {fps:.1f} | Buffer: {buf_len} | Resize:{bool(need_resize)}")
+                try: buf_len = len(inputs_list)
+                except Exception: buf_len = -1
                 frame_count = 0
                 last_log_time = now
-
-    except Exception as e:
-        print(f"Capture loop error: {e}")
-        try:
-            camera.stop()
-        except Exception:
-            pass
+    except Exception:
+        try: camera.stop()
+        except Exception: pass
         _screen_capture_loop_mss(stop_evt, height, width, region_ref, max_buffer, inputs_list)
     finally:
-        try:
-            camera.stop()
-        except Exception:
-            pass
+        try: camera.stop()
+        except Exception: pass
 
-def _screen_capture_loop_mss(stop_evt: threading.Event,
-                             height: int, width: int,
-                             region_ref: Dict[str, Dict[str, int]],
-                             max_buffer: int,
-                             inputs_list: List[Any]):
+def _screen_capture_loop_mss(stop_evt: threading.Event, height: int, width: int, region_ref: Dict[str, Dict[str, int]], max_buffer: int, inputs_list: List[Any]):
     torch = PreloadedDependencies.get_torch()
-    if torch is None:
-        return
-    try:
-        import mss
-    except Exception:
-        return
-
+    if torch is None: return
+    try: import mss
+    except Exception: return
     with mss.mss() as sct:
         while not stop_evt.is_set():
             rect = region_ref["rect"]
             monitor = {k: int(rect[k]) for k in ("left","top","width","height")}
             raw = sct.grab(monitor)
-
             bgra  = np.frombuffer(raw.bgra, dtype=np.uint8).reshape(raw.height, raw.width, 4)
             frame = bgra[:, :, :3][:, :, ::-1]
-
             if (frame.shape[1], frame.shape[0]) != (width, height):
                 frame = np.array(PIL.Image.fromarray(frame, "RGB").resize((width, height), resample=PIL.Image.BICUBIC))
-
-            tensor = torch.from_numpy(frame.astype(np.float32) / 255.0)\
-                         .permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)
+            tensor = torch.from_numpy(frame.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0).clamp(0.0, 1.0)
             inputs_list.append(tensor)
             if isinstance(inputs_list, list) and len(inputs_list) > max_buffer:
                 del inputs_list[:-max_buffer]
 
-# =========================
-# Worker
-# =========================
 def _load_stream_wrapper():
-    # Locate wrapper.py, whether frozen or running from source
     base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     wrapper_path = os.path.join(base_dir, "wrapper.py")
-
     spec = importlib.util.spec_from_file_location("wrapper", wrapper_path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules["wrapper"] = mod
     spec.loader.exec_module(mod)
     return getattr(mod, "StreamDiffusionWrapper")
 
-
-def image_generation_process(
-    out_queue: Queue,
-    fps_queue: Queue,
-    close_queue: Queue,
-    status_queue: Queue,
-    control_queue: Queue,
-    debug_queue: Queue,
-    t_index_list: List[int],
-    model_path_dir: str,
-    controlnet_paths: List[str],
-    controlnet_scales: List[float],
-    lora_dict: Optional[Dict[str, float]],
-    prompt: str,
-    negative_prompt: str,
-    frame_buffer_size: int,
-    width: int,
-    height: int,
-    acceleration: Literal["none", "xformers", "tensorrt"],
-    use_denoising_batch: bool,
-    seed: int,
-    cfg_type: Literal["none", "full", "self", "initialize"],
-    guidance_scale: float,
-    delta: float,
-    do_add_noise: bool,
-    enable_similar_image_filter: bool,
-    similar_image_filter_threshold: float,
-    similar_image_filter_max_skip_frame: float,
-    monitor_receiver: Connection,
-    offline: bool = True,
-) -> None:
-    
-    import sys
-    import os
+def image_generation_process(out_queue: Queue, fps_queue: Queue, close_queue: Queue, status_queue: Queue, control_queue: Queue, debug_queue: Queue, t_index_list: List[int], model_path_dir: str, controlnet_paths: List[str], controlnet_scales: List[float], lora_dict: Optional[Dict[str, float]], prompt: str, negative_prompt: str, frame_buffer_size: int, width: int, height: int, acceleration: Literal["none", "xformers", "tensorrt"], use_denoising_batch: bool, seed: int, cfg_type: Literal["none", "full", "self", "initialize"], guidance_scale: float, delta: float, do_add_noise: bool, enable_similar_image_filter: bool, similar_image_filter_threshold: float, similar_image_filter_max_skip_frame: float, monitor_receiver: Connection, offline: bool = True) -> None:
+    import sys, os
     from pathlib import Path
     
-    # Determine APP_ROOT and INTERNAL_DIR for worker process
     if getattr(sys, "frozen", False):
         APP_ROOT_WORKER = Path(sys.executable).parent
+        SITE_PACKAGES_WORKER = APP_ROOT_WORKER / "venv" / "Lib" / "site-packages"
     else:
         APP_ROOT_WORKER = Path(__file__).resolve().parent
-    
-    INTERNAL_DIR_WORKER = APP_ROOT_WORKER / "_internal"
-    
-    # Add _internal to sys.path FIRST
-    internal_str = str(INTERNAL_DIR_WORKER)
+        SITE_PACKAGES_WORKER = APP_ROOT_WORKER / "venv" / "Lib" / "site-packages"
+        
+    internal_str = str(SITE_PACKAGES_WORKER)
     if internal_str not in sys.path:
         sys.path.insert(0, internal_str)
-        print(f"[Worker] Added to sys.path: {internal_str}")
-    
-    # Set up DLL search paths for ALL packages with DLLs
-    dll_packages = ["torch", "xformers"]
-    
-    for package in dll_packages:
-        pkg_dir = INTERNAL_DIR_WORKER / package
-        if pkg_dir.exists():
-            # Try lib subdirectory
-            lib_dir = pkg_dir / "lib"
-            if lib_dir.exists():
-                try:
-                    os.add_dll_directory(str(lib_dir))
-                    print(f"[Worker] Added DLL dir: {lib_dir}")
-                except:
-                    pass
-                
-                current_path = os.environ.get("PATH", "")
-                if str(lib_dir) not in current_path:
-                    os.environ["PATH"] = str(lib_dir) + os.pathsep + current_path
-            
-            # Also add package root if it has DLLs
-            if any(pkg_dir.glob("*.dll")):
-                try:
-                    os.add_dll_directory(str(pkg_dir))
-                    print(f"[Worker] Added DLL dir: {pkg_dir}")
-                except:
-                    pass
-                
-                current_path = os.environ.get("PATH", "")
-                if str(pkg_dir) not in current_path:
-                    os.environ["PATH"] = str(pkg_dir) + os.pathsep + current_path
-    
-    # Add common bin directories
-    for bin_dir in [INTERNAL_DIR_WORKER / "bin", INTERNAL_DIR_WORKER / "Library" / "bin"]:
-        if bin_dir.exists():
-            try:
-                os.add_dll_directory(str(bin_dir))
-            except:
-                pass
-    
-    print("[Worker] DLL search paths configured")
-
-
-    _prime_dll_search()
-    
+        
+    _prime_dll_search(SITE_PACKAGES_WORKER, INTERNAL_DIR)
     import_torch = PreloadedDependencies.get_torch()
     
     def _status(msg: str):
-        try: 
-            status_queue.put_nowait(msg)
-        except Exception: 
-            pass
+        try: status_queue.put_nowait(msg)
+        except Exception: pass
 
     try:
-        _status("Worker process: initializing...")
-    
         if import_torch is None:
-            _status("ERROR: Torch not available in worker process")
-           
-            _prime_dll_search()
+            _prime_dll_search(SITE_PACKAGES_WORKER, INTERNAL_DIR)
             import_torch = PreloadedDependencies.get_torch()
-            if import_torch is None:
-                _status("CRITICAL: Torch not found after path extension")
-                return
+            if import_torch is None: return
 
-        _status(f"Torch loaded: {import_torch.__version__}")
-        _status(f"CUDA available: {import_torch.cuda.is_available()}")
-    
         StreamDiffusionWrapper = _load_stream_wrapper()
-        _status("StreamDiffusionWrapper imported")
-
-        _status("Setting up pipeline...")
-        if offline: 
-            enforce_offline_mode()
-            _status("Offline mode enabled")
-        
+        if offline: enforce_offline_mode()
         verify_local_model_path_dir(model_path_dir)
-        _status(f"Model path verified: {model_path_dir}")
 
-        # Initialize Stream Diffusion - wrapper handles all optimizations internally
-        _status("Initializing StreamDiffusion...")
         stream = StreamDiffusionWrapper(
-            model_id_or_path=model_path_dir,
-            t_index_list=list(t_index_list),
-            frame_buffer_size=frame_buffer_size,
-            width=width,
-            height=height,
-            warmup=2,
-            acceleration=acceleration,
-            do_add_noise=do_add_noise,
-            enable_similar_image_filter=enable_similar_image_filter,
-            similar_image_filter_threshold=similar_image_filter_threshold,
-            similar_image_filter_max_skip_frame=similar_image_filter_max_skip_frame,
-            mode="img2img",
-            use_denoising_batch=use_denoising_batch,
-            cfg_type=cfg_type,
-            seed=seed,
-            lora_dict=lora_dict,
+            model_id_or_path=model_path_dir, t_index_list=list(t_index_list), frame_buffer_size=frame_buffer_size, width=width, height=height, warmup=2, acceleration=acceleration, do_add_noise=do_add_noise, enable_similar_image_filter=enable_similar_image_filter, similar_image_filter_threshold=similar_image_filter_threshold, similar_image_filter_max_skip_frame=similar_image_filter_max_skip_frame, mode="img2img", use_denoising_batch=use_denoising_batch, cfg_type=cfg_type, seed=seed, lora_dict=lora_dict
         )
-        _status("StreamDiffusion model prepared")
-
-        # Prepare the pipeline
-        _status("Preparing pipeline with prompts...")
-        stream.prepare(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_inference_steps=50,
-            guidance_scale=guidance_scale,
-            delta=delta,
-        )
-        _status("Pipeline prepared successfully")
-
-        # Wait for initial region from GUI
-        _status("Waiting for capture region...")
+        stream.prepare(prompt=prompt, negative_prompt=negative_prompt, num_inference_steps=50, guidance_scale=guidance_scale, delta=delta)
         first_rect = monitor_receiver.recv()
         region_ref = {"rect": dict(first_rect)}
-        _status(f"Capture region received: {first_rect}")
-
-        # Setup capture
         inputs = deque(maxlen=frame_buffer_size * 2)
         cap_stop = threading.Event()
-    
-        _status("Starting screen capture thread...")
-        cap_thr = threading.Thread(
-            target=_screen_capture_loop_dx,
-            args=(cap_stop, height, width, region_ref, frame_buffer_size, inputs),
-            daemon=True,
-        )
+        cap_thr = threading.Thread(target=_screen_capture_loop_dx, args=(cap_stop, height, width, region_ref, frame_buffer_size, inputs), daemon=True)
         cap_thr.start()
-        _status("Screen capture started")
-    
         current_t_index_list = list(t_index_list)
         frame_count = 0
-        _status("Entering main processing loop...")
 
-        # Main processing loop
         while close_queue.empty():
-            # Handle control messages from GUI
             try:
                 while True:
                     msg = control_queue.get_nowait()
-                    if not isinstance(msg, dict): 
-                        continue
-                    
+                    if not isinstance(msg, dict): continue
                     mtype = msg.get("type")
-
                     if mtype == "set_region":
                         r = msg.get("region")
                         if isinstance(r, dict) and all(k in r for k in ("left","top","width","height")):
                             region_ref["rect"] = {k:int(r[k]) for k in ("left","top","width","height")}
-
                     elif mtype == "set_t_at":
                         i = int(msg.get("index", -1))
                         val = int(msg.get("value", 30))
                         if 0 <= i < len(current_t_index_list):
                             current_t_index_list[i] = max(2, min(49, val))
                             stream.set_t_index_list(current_t_index_list)
-                            _status(f"t[{i}] → {current_t_index_list[i]}")
-
                     elif mtype == "set_t_index_list":
                         new_t = msg.get("t_index_list")
                         if isinstance(new_t, (list, tuple)) and len(new_t) > 0:
-                            current_t_index_list = [int(max(2, min(49, x))) for x in new_t]
-                            stream.set_t_index_list(current_t_index_list)
-                            _status(f"t_index_list → {current_t_index_list}")
-
-                    elif mtype == "set_prompt":
-                        new_prompt = str(msg.get("prompt", prompt))
-                        prompt = new_prompt
-                        try:
-                            # Fix: stream.update_prompt, not stream.stream.update_prompt
-                            stream.update_prompt(prompt, negative_prompt=negative_prompt)
-                            _status("Prompt updated live")
-                        except Exception:
-                            # Fallback: prepare, but preserve t_index_list
-                            stream.prepare(
-                                prompt=prompt, 
-                                negative_prompt=negative_prompt,
-                                num_inference_steps=50, 
-                                guidance_scale=guidance_scale, 
-                                delta=delta
-                            )
-                            # CRITICAL: Restore the t_index_list after prepare
-                            stream.set_t_index_list(current_t_index_list)
-                            _status("Pipeline re-prepared with new prompt (t_list restored)")
-
-                    elif mtype == "set_negative_prompt":
-                        new_neg_prompt = str(msg.get("negative_prompt", negative_prompt))
-                        negative_prompt = new_neg_prompt
-                        try:
-                            # Fix: stream.update_prompt, not stream.stream.update_prompt
-                            stream.update_prompt(prompt, negative_prompt=negative_prompt)
-                            _status("Negative prompt updated live")
-                        except Exception:
-                            # Fallback: prepare, but preserve t_index_list
-                            stream.prepare(
-                                prompt=prompt, 
-                                negative_prompt=negative_prompt,
-                                num_inference_steps=50, 
-                                guidance_scale=guidance_scale, 
-                                delta=delta
-                            )
-                            # CRITICAL: Restore the t_index_list after prepare
-                            stream.set_t_index_list(current_t_index_list)
-                            _status("Pipeline re-prepared with new negative prompt (t_list restored)")
+                            new_t_clean = [int(max(2, min(49, x))) for x in new_t]
                             
+                            # Check if the NUMBER of steps changed (Requires Engine Swap)
+                            if len(new_t_clean) != len(current_t_index_list):
+                                _status(f"Swapping engine for {len(new_t_clean)} steps...")
+                                current_t_index_list = new_t_clean
+                                
+                                # Flush current engine from VRAM
+                                del stream
+                                import gc; gc.collect(); import_torch.cuda.empty_cache()
+                                
+                                # Re-instantiate the wrapper to load the correct TensorRT engine
+                                stream = StreamDiffusionWrapper(
+                                    model_id_or_path=model_path_dir, 
+                                    t_index_list=list(current_t_index_list), 
+                                    frame_buffer_size=frame_buffer_size, width=width, height=height, 
+                                    warmup=2, acceleration=acceleration, do_add_noise=do_add_noise, 
+                                    enable_similar_image_filter=enable_similar_image_filter, 
+                                    similar_image_filter_threshold=similar_image_filter_threshold, 
+                                    similar_image_filter_max_skip_frame=similar_image_filter_max_skip_frame, 
+                                    mode="img2img", use_denoising_batch=use_denoising_batch, 
+                                    cfg_type=cfg_type, seed=seed, lora_dict=lora_dict
+                                )
+                                stream.prepare(prompt=prompt, negative_prompt=negative_prompt, num_inference_steps=50, guidance_scale=guidance_scale, delta=delta)
+                                _status("Engine swap complete!")
+                            else:
+                                # Length is the same (Slider was dragged). Update values instantly!
+                                current_t_index_list = new_t_clean
+                                stream.set_t_index_list(current_t_index_list)
+                    elif mtype == "set_prompt":
+                        prompt = str(msg.get("prompt", prompt))
+                        try:
+                            stream.stream.update_prompt(prompt)
+                        except Exception:
+                            pass
+                    elif mtype == "set_negative_prompt":
+                        negative_prompt = str(msg.get("negative_prompt", negative_prompt))
+                        try:
+                            stream.stream.update_prompt(prompt)
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
-            # Wait until we have enough frames
-            if len(inputs) < frame_buffer_size:
-                time.sleep(0.004)
-                continue
-
             try:
                 t0 = time.time()
-
-                # Prepare batch tensor
                 if frame_buffer_size == 1:
                     batch = inputs[-1]
                 else:
@@ -1162,92 +710,61 @@ def image_generation_process(
                         sampled.append(inputs[idx])
                     batch = import_torch.cat(sampled)
 
-                # Clean up old frames if using list
                 if isinstance(inputs, list) and len(inputs) > frame_buffer_size * 2:
                     del inputs[:-frame_buffer_size]
 
-                # Ensure tensor is on correct device/dtype
                 if isinstance(batch, import_torch.Tensor):
                     batch = batch.to(device=stream.device, dtype=stream.dtype)
 
-                # Run through stream diffusion - wrapper handles everything
                 res = stream.img2img(batch)
-
-                # Result is already PIL images from wrapper
                 images = []
-                if isinstance(res, Image.Image):
-                    images = [res]
-                elif isinstance(res, list):
-                    images = res
+                if isinstance(res, Image.Image): images = [res]
+                elif isinstance(res, list): images = res
 
-                # Send results to GUI
                 for im in images:
                     try: 
                         out_queue.put(im, block=False)
                         frame_count += 1
-                    except queue.Full: 
-                        pass
+                    except queue.Full: pass
 
-                # Calculate and send FPS
                 elapsed = time.time() - t0
                 fps = (1.0/elapsed) if elapsed > 0 else 0.0
                 while not fps_queue.empty():
                     try: fps_queue.get_nowait()
                     except Exception: break
                 fps_queue.put(int(round(fps)))
-
-                if frame_count % 30 == 0:
-                    _status(f"Processed {frame_count} frames, FPS: {fps:.1f}")
-
-            except Exception as e:
-                _status(f"Processing error: {e}")
+            except Exception:
                 time.sleep(0.01)
 
-        # Cleanup
-        _status("Stopping capture...")
         cap_stop.set()
         cap_thr.join(timeout=2.0)
-        _status("Worker process finished")
-
     except KeyboardInterrupt:
-        _status("Worker interrupted by keyboard")
-    except Exception as e:
-        _status(f"Worker fatal error: {e}")
-        import traceback
-        _status(f"Traceback: {traceback.format_exc()}")
+        pass
+    except Exception:
+        pass
 
-# =========================
-# GPU Bootstrap Functions
-# =========================
 def _python_cmd_for_pip():
     import sys, shutil
     if getattr(sys, "frozen", False):
         v = f"-{sys.version_info.major}.{sys.version_info.minor}"
-        if shutil.which("py"):
-            return ["py", v]
+        if shutil.which("py"): return ["py", v]
         p = shutil.which("python")
-        if p:
-            return [p]
-        raise RuntimeError("No external Python found in PATH. Install Python and try again.")
+        if p: return [p]
+        raise RuntimeError("No external Python found in PATH.")
     return [sys.executable]
 
 def _gpu_run(cmd, env=None, on_progress=None, cwd=None, shell=False, no_window=True, progress_callback=None):
-    """Run a command, stream lines to UI + log; raise on non-zero exit."""
     import os, subprocess, tempfile, time, re, sys
     from pathlib import Path
-
     log_path = Path(tempfile.gettempdir()) / "screen_diffusion_pip_debug.log"
 
     def tee(line: str):
         if callable(on_progress):
             try: on_progress(line)
             except Exception: pass
-        
         try:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
+            with open(log_path, "a", encoding="utf-8") as f: f.write(line + "\n")
+        except Exception: pass
 
     env2 = dict(os.environ)
     if env: env2.update(env)
@@ -1262,373 +779,152 @@ def _gpu_run(cmd, env=None, on_progress=None, cwd=None, shell=False, no_window=T
     if os.name == "nt" and no_window:
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         startupinfo = subprocess.STARTUPINFO()
-        try:
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        except Exception:
-            pass
+        try: startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        except Exception: pass
 
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=False,
-        bufsize=0,  # Unbuffered
-        env=env2,
-        cwd=cwd,
-        shell=shell,
-        creationflags=creationflags,
-        startupinfo=startupinfo,
-    )
-
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False, bufsize=0, env=env2, cwd=cwd, shell=shell, creationflags=creationflags, startupinfo=startupinfo)
     try:
         assert proc.stdout is not None
         buf = bytearray()
         last_yield_time = time.time()
-
         while True:
-            # Read available bytes
-            chunk = proc.stdout.read(64)  # Read in small chunks for responsiveness
+            chunk = proc.stdout.read(64)
             if not chunk:
-                if proc.poll() is not None:
-                    break
+                if proc.poll() is not None: break
                 time.sleep(0.01)
                 continue
-            
             buf.extend(chunk)
-            
-            # Try to decode and process
             try:
                 text = buf.decode("utf-8", errors="replace")
-                
-                # Split on newlines
                 lines = text.split('\n')
-                
-                # Keep the last incomplete line in buffer
                 if not text.endswith('\n'):
                     incomplete = lines[-1]
                     buf = bytearray(incomplete.encode("utf-8"))
                     lines = lines[:-1]
                 else:
                     buf = bytearray()
-                
-                # Yield complete lines
                 for line in lines:
-                    # Handle carriage returns - take the last part after \r
-                    if '\r' in line:
-                        line = line.split('\r')[-1]
-                    
+                    if '\r' in line: line = line.split('\r')[-1]
                     line = line.strip()
                     if line:
                         tee(line)
                         yield line
-                
-                # Also yield progress updates periodically even if line isn't complete
                 now = time.time()
-                if buf and (now - last_yield_time) > 0.5:  # Every 500ms
+                if buf and (now - last_yield_time) > 0.5:
                     partial = buf.decode("utf-8", errors="replace")
-                    if '\r' in partial:
-                        partial = partial.split('\r')[-1]
+                    if '\r' in partial: partial = partial.split('\r')[-1]
                     partial = partial.strip()
-                    if partial and len(partial) > 20:  # Only if substantial
+                    if partial and len(partial) > 20:
                         tee(partial)
                         yield partial
                         last_yield_time = now
-                        
-            except Exception as e:
-                # If decode fails, skip this chunk
-                pass
-
-        # Flush remaining buffer
+            except Exception: pass
         if buf:
             try:
                 line = buf.decode("utf-8", errors="replace").strip()
                 if line:
                     tee(line)
                     yield line
-            except Exception:
-                pass
-
+            except Exception: pass
     finally:
         proc.wait()
-
     if proc.returncode != 0:
-        raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(map(str, cmd))}")
+        raise RuntimeError(f"Command failed ({proc.returncode})")
 
 def _parse_pip_progress(line: str, progress_callback):
-    """Parse pip output to extract download/building progress and update progress bar."""
     import re
-    
     line = line.strip()
-    
-    # Download progress patterns
-    download_patterns = [
-        r"Downloading\s+[^\n]*\s+(\d{1,3})%",
-        r"[\|#]\s*(\d{1,3})%",
-        r"(\d{1,3})%\s*[\|#]",
-    ]
-    
-    # Installation/building patterns  
-    install_patterns = [
-        r"Building wheel for.*\((\d{1,3})%\)",
-        r"Installing.*\((\d{1,3})%\)",
-    ]
-    
-    # Check for download progress
+    download_patterns = [r"Downloading\s+[^\n]*\s+(\d{1,3})%", r"[\|#]\s*(\d{1,3})%", r"(\d{1,3})%\s*[\|#]"]
+    install_patterns = [r"Building wheel for.*\((\d{1,3})%\)", r"Installing.*\((\d{1,3})%\)"]
     for pattern in download_patterns:
         match = re.search(pattern, line)
         if match:
             percent = int(match.group(1))
             progress_callback(percent / 100.0, f"Downloading: {percent}%")
             return
-    
-    # Check for installation progress
     for pattern in install_patterns:
         match = re.search(pattern, line)
         if match:
             percent = int(match.group(1))
             progress_callback(percent / 100.0, f"Installing: {percent}%")
             return
+    if "Successfully installed" in line: progress_callback(1.0, "Installation complete!")
+    elif "Building wheel" in line and "complete" in line.lower(): progress_callback(1.0, "Build complete!")
+    elif "Downloaded" in line and "MB" in line: progress_callback(1.0, "Download complete!")
+
+def _search_caches_for_wheel(pattern: str):
+    import os, re
+    from pathlib import Path
+    cache_dirs = []
+    for env_var in ["LOCALAPPDATA", "APPDATA", "TEMP"]:
+        val = os.environ.get(env_var)
+        if val: cache_dirs.append(Path(val) / "pip" / "cache")
+    cache_dirs.append(Path.home() / ".cache" / "pip")
+    cache_dirs.append(INTERNAL_DIR / ".pip-cache")
     
-    # Check for completion indicators
-    if "Successfully installed" in line:
-        progress_callback(1.0, "Installation complete!")
-    elif "Building wheel" in line and "complete" in line.lower():
-        progress_callback(1.0, "Build complete!")
-    elif "Downloaded" in line and "MB" in line:
-        progress_callback(1.0, "Download complete!")
+    best_match = None
+    best_pattern_idx = 999
+    patterns = pattern if isinstance(pattern, list) else [pattern]
+    
+    for cache_dir in cache_dirs:
+        if not cache_dir.exists(): continue
+        for root, _, files in os.walk(cache_dir):
+            for filename in files:
+                if not filename.endswith('.whl'): continue
+                for idx, pat in enumerate(patterns):
+                    if re.match(pat, filename, re.IGNORECASE):
+                        wheel_path = Path(root) / filename
+                        if not (wheel_path.is_file() and os.access(wheel_path, os.R_OK)): continue
+                        if idx < best_pattern_idx:
+                            best_match = wheel_path
+                            best_pattern_idx = idx
+                        if idx == 0: return wheel_path
+    return best_match
 
 def _find_wheel_in_cache(package_name: str, version: str, cuda_version: str = "cu118"):
-    """Find a wheel file in pip cache directories."""
-    import os
-    from pathlib import Path
     import re
-    
-    cache_locations = []
-    
-    # Windows pip cache (most common)
-    try:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            win_cache = Path(local_app_data) / "pip" / "cache"
-            if win_cache.exists():
-                cache_locations.append(win_cache)
-    except Exception:
-        pass
-    
-    # User pip cache (Linux/Mac style on Windows)
-    try:
-        user_cache = Path.home() / ".cache" / "pip"
-        if user_cache.exists():
-            cache_locations.append(user_cache)
-    except Exception:
-        pass
-    
-    # AppData Roaming cache
-    try:
-        roaming = os.environ.get("APPDATA")
-        if roaming:
-            roaming_cache = Path(roaming) / "pip" / "cache"
-            if roaming_cache.exists():
-                cache_locations.append(roaming_cache)
-    except Exception:
-        pass
-    
-    # Our custom cache
-    custom_cache = INTERNAL_DIR / ".pip-cache"
-    if custom_cache.exists():
-        cache_locations.append(custom_cache)
-    
-    # Temp pip cache
-    try:
-        temp_cache = Path(os.environ.get("TEMP", "/tmp")) / "pip-cache"
-        if temp_cache.exists():
-            cache_locations.append(temp_cache)
-    except Exception:
-        pass
-    
-    # Build regex patterns for various naming conventions
     version_escaped = re.escape(version)
     cuda_escaped = re.escape(cuda_version)
-    
     patterns = [
         rf"^{package_name}-{version_escaped}[\+%2B]{cuda_escaped}-cp\d+-cp\d+-.*\.whl$",
         rf"^{package_name}-{version_escaped}\.post\d+[\+%2B]{cuda_escaped}-cp\d+-cp\d+-.*\.whl$",
         rf"^{package_name}-{version_escaped}[\+%2B]{cuda_escaped}\.whl$",
         rf"^{package_name}-{version_escaped}.*{cuda_escaped}.*\.whl$",
     ]
-    
-    best_match = None
-    best_pattern_idx = len(patterns)
-    
-    for cache_dir in cache_locations:
-        try:
-            for root, dirs, files in os.walk(cache_dir):
-                for filename in files:
-                    if not filename.endswith('.whl'):
-                        continue
-                    
-                    for idx, pattern in enumerate(patterns):
-                        if re.match(pattern, filename, re.IGNORECASE):
-                            wheel_path = Path(root) / filename
-                            
-                            if not (wheel_path.is_file() and os.access(wheel_path, os.R_OK)):
-                                continue
-                            
-                            if idx < best_pattern_idx:
-                                best_match = wheel_path
-                                best_pattern_idx = idx
-                            
-                            if idx == 0:
-                                return wheel_path
-                            
-                            break
-                            
-        except Exception:
-            continue
-    
-    return best_match
-
-
+    return _search_caches_for_wheel(patterns)
 
 def _find_streamdiffusion_in_cache(package_name: str):
-    """Find any streamdiffusion wheel file in pip cache directories."""
-    import os
-    from pathlib import Path
-    import re
-    
-    cache_locations = []
-    
-    # Windows pip cache (most common)
-    try:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            win_cache = Path(local_app_data) / "pip" / "cache"
-            if win_cache.exists():
-                cache_locations.append(win_cache)
-    except Exception:
-        pass
-    
-    # User pip cache (Linux/Mac style on Windows)
-    try:
-        user_cache = Path.home() / ".cache" / "pip"
-        if user_cache.exists():
-            cache_locations.append(user_cache)
-    except Exception:
-        pass
-    
-    # AppData Roaming cache
-    try:
-        roaming = os.environ.get("APPDATA")
-        if roaming:
-            roaming_cache = Path(roaming) / "pip" / "cache"
-            if roaming_cache.exists():
-                cache_locations.append(roaming_cache)
-    except Exception:
-        pass
-    
-    # Our custom cache
-    custom_cache = INTERNAL_DIR / ".pip-cache"
-    if custom_cache.exists():
-        cache_locations.append(custom_cache)
-    
-    # Temp pip cache
-    try:
-        temp_cache = Path(os.environ.get("TEMP", "/tmp")) / "pip-cache"
-        if temp_cache.exists():
-            cache_locations.append(temp_cache)
-    except Exception:
-        pass
-    
-    # Build regex pattern for streamdiffusion
-    pattern = rf"^{package_name}-.*\.whl$"
-    
-    for cache_dir in cache_locations:
-        try:
-            for root, dirs, files in os.walk(cache_dir):
-                for filename in files:
-                    if not filename.endswith('.whl'):
-                        continue
-                    
-                    if re.match(pattern, filename, re.IGNORECASE):
-                        wheel_path = Path(root) / filename
-                        
-                        if wheel_path.is_file() and os.access(wheel_path, os.R_OK):
-                            return wheel_path
-                            
-        except Exception:
-            continue
-    
-    return None
+    return _search_caches_for_wheel(rf"^{package_name}-.*\.whl$")
 
 def install_streamdiffusion(on_progress=None, skip_torch=True, progress_callback=None):
-    """Install StreamDiffusion ONLY, without PyTorch dependencies. Returns success status."""
-    
     py_cmd = _python_cmd_for_pip()
     streamdiffusion_package = "streamdiffusion[tensorrt]"
-    
-    if on_progress:
-        on_progress("Installing StreamDiffusion (excluding PyTorch dependencies)...")
-    
+    if on_progress: on_progress("Installing StreamDiffusion...")
     try:
-        # Install StreamDiffusion with --no-deps to avoid installing torch
-        cmd = [
-            *py_cmd, "-m", "pip", "install",
-            "--target", str(INTERNAL_DIR),
-            "--no-deps",  # This prevents installing dependencies
-            streamdiffusion_package,
-        ]
-        
-        for line in _gpu_run(cmd, on_progress=on_progress, no_window=not GPU_DIAGNOSTIC, progress_callback=progress_callback):
-            pass
-        
-        if on_progress:
-            on_progress("✓ StreamDiffusion installed (without dependencies)!")
-            
-    except Exception as e:
-        if on_progress:
-            on_progress(f"✗ StreamDiffusion installation failed: {e}")
-        return False
-    
-    # Verify installation
-    if on_progress:
-        on_progress("Verifying StreamDiffusion installation...")
-    
+        cmd = [*py_cmd, "-m", "pip", "install", "--no-deps", streamdiffusion_package]
+        for line in _gpu_run(cmd, on_progress=on_progress, no_window=not GPU_DIAGNOSTIC, progress_callback=progress_callback): pass
+        if on_progress: on_progress("StreamDiffusion installed!")
+    except Exception: return False
     try:
-        # Test if we can import streamdiffusion
-        test_cmd = [
-            *py_cmd, "-c", 
-            "import sys; sys.path.insert(0, r'{}'); import streamdiffusion; print('StreamDiffusion OK')".format(str(INTERNAL_DIR))
-        ]
-        result = subprocess.run(test_cmd, check=True, capture_output=True, text=True)
-        if on_progress:
-            on_progress("✅ StreamDiffusion verified!")
+        test_cmd = [*py_cmd, "-c", "import sys; sys.path.insert(0, r'{}'); import streamdiffusion;".format(str(INTERNAL_DIR))]
+        subprocess.run(test_cmd, check=True, capture_output=True, text=True)
         return True
-    except Exception as e:
-        if on_progress:
-            on_progress(f"⚠ StreamDiffusion import failed: {e}")
-        return False
+    except Exception: return False
 
 def _gpu_relaunch_into_runtime():
-    """Relaunch the application."""
     import sys, os
     os.environ[BOOT_FLAG] = "1"
     os.execv(sys.executable, [sys.executable] + sys.argv)
+
 class StreamGUI(ctk.CTk):
     def __init__(self):
         import multiprocessing as mp
-        if mp.current_process().name != 'MainProcess':
-            print(f"Preventing GUI creation in worker process: {mp.current_process().name}")
-            return
-
+        if mp.current_process().name != 'MainProcess': return
         super().__init__()
-        
         self.title("Screen Diffusion")
         self.geometry("1180x840")
         self.minsize(1060, 760)
-        
-        # Set icon early in initialization
         self._set_window_icon()
-        
         self.collapse_var = ctk.BooleanVar(value=False)
         self.collapse_btn = None
         self.left_panel = None
@@ -1637,13 +933,11 @@ class StreamGUI(ctk.CTk):
         self.header_frame = None
         self._cache_mon_running = False
         self.preview_dim = 512
-
         self.proc_ctx = None
         self.proc_worker = None
         self.out_q = self.fps_q = self.status_q = self.control_q = self.debug_q = self.close_q = None
         self.monitor_sender = self.monitor_receiver = None
         self.running = False
-
         self.model_var = ctk.StringVar(value=LOCAL_MODEL_PATH)
         self.prompt_var = ctk.StringVar(value="flip book animation, black and white rough sketch, rough drawing")
         self.neg_prompt_var = ctk.StringVar(value="low quality, bad quality, blurry, low resolution")
@@ -1660,640 +954,368 @@ class StreamGUI(ctk.CTk):
         self.sim_thresh_var = ctk.StringVar(value="0.99")
         self.sim_maxskip_var = ctk.StringVar(value="10.0")
         self.offline_var = ctk.BooleanVar(value=True)
-        
         self._debounce_prompt = self._debounce_neg = self._debounce_region = None
-
         self.t_index_list: List[int] = [30]
         self._lockables: List[ctk.CTkBaseClass] = []
         self._step_sliders: List[ctk.CTkSlider] = []
-
         self.capwin: Optional[FloatingCaptureWindow] = None
-        self._ctk_img: Optional[ctk.CTkImage] = None
         self.bind("<h>", lambda e: self._toggle_capture_window())
         self.bind("<H>", lambda e: self._toggle_capture_window())
         try:
             logo_path = os.path.join(os.path.dirname(__file__), "logo.png")
             img = Image.open(logo_path)
-            self.logo_img = ctk.CTkImage(
-                light_image=img, dark_image=img, size=(28, 28)
-            )
+            self.logo_img = ctk.CTkImage(light_image=img, dark_image=img, size=(28, 28))
         except Exception:
             self.logo_img = None
-            
         self._build_ui()
         self._setup_input_validation()
-        self.after(500, self._check_and_hide_gpu_frame)
         self.bind("<Configure>", self._on_window_configure)
         self._poll_queues()
         self.protocol("WM_DELETE_WINDOW", self.do_quit)
 
     def _toggle_capture_window(self):
-        """Toggle visibility of capture window while keeping capture active"""
-        if not self.running or self.capwin is None:
-            return
-    
+        if not self.running or self.capwin is None: return
         try:
             if self.capwin.win.state() == "normal":
-                # Hide the window
                 self.capwin.win.withdraw()
                 self.hide_capture_btn.configure(text="👁 Show (H)")
-                self.status_var.set("Capture window hidden (press H to show)")
+                self.status_var.set("Capture window hidden")
             else:
-                # Show the window
                 self.capwin.win.deiconify()
                 self.hide_capture_btn.configure(text="👁 Hide (H)")
                 self.status_var.set("Capture window visible")
-                # Update capture region in case window was moved
                 self._send_region_update()
-        except Exception as e:
-            print(f"Error toggling capture window: {e}")
+        except Exception: pass
 
     def _set_window_icon(self):
-        """Set window icon"""
         try:
-            icon_paths = [
-                resource_path("icon2.ico"),
-                os.path.join(os.path.dirname(__file__), "icon2.ico"),
-            ]
-            
+            icon_paths = [resource_path("icon2.ico"), os.path.join(os.path.dirname(__file__), "icon2.ico")]
             for icon_path in icon_paths:
                 if os.path.exists(icon_path):
                     self.iconbitmap(icon_path)
-                    print(f"Window icon set from: {icon_path}")
                     return True
-        except Exception as e:
-            print(f"Failed to set window icon: {e}")
+        except Exception: pass
         return False
 
     def _setup_input_validation(self):
-        """Set up validation for numeric entry fields"""
         def validate_numeric_input(P):
-            if P == "" or P == "-":
-                return True
-            try:
-                float(P)
-                return True
-            except ValueError:
-                return False
-    
+            if P == "" or P == "-": return True
+            try: float(P); return True
+            except ValueError: return False
         vcmd = (self.register(validate_numeric_input), '%P')
-    
         numeric_entries = [
-            self._w_seed_entry,
-            self._w_guidance_entry,
-            self._w_delta_entry,
-            self._w_sim_thresh,
-            self._w_sim_maxskip
+            getattr(self, '_w_seed_entry', None),
+            getattr(self, '_w_guidance_entry', None),
+            getattr(self, '_w_delta_entry', None),
+            getattr(self, '_w_sim_thresh', None),
+            getattr(self, '_w_sim_maxskip', None),
         ]
-    
         for entry in numeric_entries:
-            if entry:
-                entry.configure(validate="key", validatecommand=vcmd)
+            if entry: entry.configure(validate="key", validatecommand=vcmd)
 
     def _download_sd_turbo(self):
-        """Download sd-turbo fp16 model using Hugging Face CLI"""
         try:
-            # Ask user where to save the model
-            download_dir = filedialog.askdirectory(
-                title="Select directory to download sd-turbo model"
-            )
-            if not download_dir:
-                return  # User cancelled
-        
+            download_dir = filedialog.askdirectory(title="Select directory to download sd-turbo model")
+            if not download_dir: return
             model_path = os.path.join(download_dir, "sd-turbo-fp16")
-    
-            # Show download dialog
             self._show_download_dialog(model_path)
-    
         except Exception as e:
             messagebox.showerror("Download Error", f"Failed to start download: {e}")
 
     def _show_download_dialog(self, model_path):
-        """Show a dialog for downloading the model"""
         dialog = ctk.CTkToplevel(self)
         dialog.title("Downloading sd-turbo fp16")
-        dialog.geometry("500x240")
+        dialog.geometry("600x400")
         dialog.transient(self)
         dialog.grab_set()
-    
-        # Add download process tracking
         self._download_process = None
         self._download_cancelled = False
         self._download_thread = None
-
-        # Center the dialog
         dialog.update_idletasks()
         x = self.winfo_x() + (self.winfo_width() - dialog.winfo_width()) // 2
         y = self.winfo_y() + (self.winfo_height() - dialog.winfo_height()) // 2
         dialog.geometry(f"+{x}+{y}")
-
-        ctk.CTkLabel(
-            dialog, 
-            text="Downloading sd-turbo fp16 model...",
-            font=ctk.CTkFont(weight="bold")
-        ).pack(pady=(20, 10))
-
-        ctk.CTkLabel(
-            dialog, 
-            text=f"Destination: {model_path}",
-            wraplength=400
-        ).pack(pady=(0, 20))
-
-        progress_bar = ctk.CTkProgressBar(dialog, width=400)
-        progress_bar.pack(pady=(0, 10))
-        progress_bar.set(0)
-
+        ctk.CTkLabel(dialog, text="Downloading sd-turbo fp16 model...", font=ctk.CTkFont(weight="bold")).pack(pady=(20, 10))
+        ctk.CTkLabel(dialog, text=f"Destination: {model_path}", wraplength=500).pack(pady=(0, 10))
         status_label = ctk.CTkLabel(dialog, text="Starting download...")
-        status_label.pack(pady=(0, 10))
-
-        cancel_btn = ctk.CTkButton(
-            dialog, 
-            text="Cancel", 
-            command=lambda: self._cancel_download(dialog, model_path)
-        )
-        cancel_btn.pack(pady=(0, 10))
-
-        # Store references
+        status_label.pack(side="top", pady=(0, 10))
+        cancel_btn = ctk.CTkButton(dialog, text="Cancel", command=lambda: self._cancel_download(dialog, model_path))
+        cancel_btn.pack(side="bottom", pady=(10, 20))
+        scroll_frame = ctk.CTkScrollableFrame(dialog, width=500, height=150)
+        scroll_frame.pack(side="top", fill="both", expand=True, padx=20, pady=(0, 10))
+        file_uis = {}
+        def ui_updater(action, filename=None, progress=0.0, text=""):
+            if self._download_cancelled: return
+            if action == "global": status_label.configure(text=text)
+            elif action == "update" and filename:
+                if filename not in file_uis:
+                    row_frame = ctk.CTkFrame(scroll_frame, fg_color="transparent")
+                    row_frame.pack(fill="x", pady=2)
+                    display_name = filename if len(filename) < 25 else filename[:22] + "..."
+                    lbl = ctk.CTkLabel(row_frame, text=f"{display_name}: 0%", width=220, anchor="w")
+                    lbl.pack(side="left", padx=(0, 10))
+                    bar = ctk.CTkProgressBar(row_frame, width=200)
+                    bar.pack(side="right", fill="x", expand=True)
+                    bar.set(0)
+                    file_uis[filename] = {'label': lbl, 'bar': bar, 'name': display_name}
+                display_name = file_uis[filename]['name']
+                file_uis[filename]['label'].configure(text=f"{display_name}: {int(progress*100)}%")
+                file_uis[filename]['bar'].set(progress)
         self._current_download_dialog = dialog
         self._current_download_path = model_path
-
-        # Start download in a separate thread
-        self._download_thread = threading.Thread(
-            target=self._run_hf_download,
-            args=(model_path, progress_bar, status_label, dialog),
-            daemon=True
-        )
+        self._download_thread = threading.Thread(target=self._run_hf_download, args=(model_path, ui_updater, dialog), daemon=True)
         self._download_thread.start()
 
     def _cleanup_partial_download(self, model_path):
-        """Remove partially downloaded files"""
         try:
             if os.path.exists(model_path):
                 import shutil
                 shutil.rmtree(model_path)
-                print(f"Cleaned up partial download: {model_path}")
-        except Exception as e:
-            print(f"Error cleaning up partial download: {e}")
+        except Exception: pass
 
     def _cancel_download(self, dialog, model_path):
-        """Cancel the download and clean up"""
-        print("Cancelling download...")
         self._download_cancelled = True
-    
-        # Terminate any subprocess
         if hasattr(self, '_download_process') and self._download_process:
             try:
-                print("Terminating download process...")
                 self._download_process.terminate()
                 import time
                 time.sleep(1)
                 if self._download_process.poll() is None:
                     self._download_process.kill()
-                    print("Download process killed")
-            except Exception as e:
-                print(f"Error terminating process: {e}")
-    
-        # Kill any remaining Python download threads by interrupting the main thread
-        if hasattr(self, '_download_thread') and self._download_thread:
-            # We can't directly kill threads, but we can make them exit quickly
-            pass
-    
-        # Clean up partial download
+            except Exception: pass
         self._cleanup_partial_download(model_path)
-    
-        # Close the dialog
         dialog.destroy()
-    
-        # Clear references
-        if hasattr(self, '_current_download_dialog'):
-            del self._current_download_dialog
-        if hasattr(self, '_current_download_path'):
-            del self._current_download_path
-    
-        print("Download cancelled successfully")
+        if hasattr(self, '_current_download_dialog'): del self._current_download_dialog
+        if hasattr(self, '_current_download_path'): del self._current_download_path
 
-    def _run_hf_download(self, model_path, progress_bar, status_label, dialog):
-        """Run the download using only CLI method for better cancellation control"""
+    def _run_hf_download(self, model_path, ui_updater, dialog):
         try:
             model_repo = "stabilityai/sd-turbo"
-    
-            def update_status(text, progress=0):
-                if self._download_cancelled:
-                    return False
-                try:
-                    self.after(0, lambda: status_label.configure(text=text))
-                    self.after(0, lambda: progress_bar.set(progress))
-                    return True
-                except Exception:
-                    return False
-    
-            def check_cancelled():
-                return self._download_cancelled
-    
-            # Use CLI method only - more reliable for cancellation
-            if not update_status("Checking Hugging Face CLI...", 0.1):
-                return
-    
-            if check_cancelled():
-                return
-    
-            # Check if huggingface-cli is available
+            def safe_ui_update(action, filename=None, progress=0.0, text=""):
+                if self._download_cancelled: return
+                try: self.after(0, lambda: ui_updater(action, filename, progress, text))
+                except Exception: pass
+            def check_cancelled(): return self._download_cancelled
+            safe_ui_update("global", text="Checking Hugging Face CLI...")
+            if check_cancelled(): return
             try:
-                subprocess.run(["huggingface-cli", "--version"], 
-                              capture_output=True, check=True, timeout=10)
+                subprocess.run(["huggingface-cli", "--version"], capture_output=True, check=True, timeout=10)
                 use_cli = True
-            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-                use_cli = False
-    
+            except: use_cli = False
             if not use_cli:
-                if not update_status("Installing huggingface_hub...", 0.2):
+                safe_ui_update("global", text="Installing huggingface_hub...")
+                try: subprocess.run([sys.executable, "-m", "pip", "install", "huggingface_hub"], check=True, capture_output=True, timeout=120)
+                except Exception as e:
+                    safe_ui_update("global", text=f"Installation failed: {e}")
                     return
-                if check_cancelled():
-                    return
-                try:
-                    result = subprocess.run([
-                        sys.executable, "-m", "pip", "install", "huggingface_hub"
-                    ], check=True, capture_output=True, text=True, timeout=120)
-                    use_cli = True
-                except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                    if not update_status(f"Installation failed: {e}", 0):
-                        return
-                    return
-    
-            if not update_status("Starting download...", 0.3):
-                return
-        
-            if check_cancelled():
-                return
-    
-            # Create model directory
+            safe_ui_update("global", text="Starting download...")
+            if check_cancelled(): return
             os.makedirs(model_path, exist_ok=True)
-    
-            # Use subprocess for download - this gives us actual process control
-            print("Starting CLI download with process control...")
-        
-            # Build the command
-            cmd = [
-                "huggingface-cli", "download", model_repo,
-                "--local-dir", model_path,
-                "--local-dir-use-symlinks", "False",
-                "--resume-download"
-            ]
-        
-            # Start the process
-            self._download_process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # Combine stdout and stderr
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
-        
-            # Monitor the process output and check for cancellation
+            cmd = ["huggingface-cli", "download", model_repo, "--local-dir", model_path, "--local-dir-use-symlinks", "False", "--resume-download", "--exclude", "sd_turbo.safetensors", "unet/diffusion_pytorch_model.safetensors", "vae/diffusion_pytorch_model.safetensors", "text_encoder/model.safetensors"]
+            self._download_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=False, bufsize=0)
             try:
-                last_progress = 0.3
+                buffer = bytearray()
+                tracked_urls = set()
                 while True:
-                    # Check for cancellation
                     if check_cancelled():
-                        print("Cancellation detected, terminating process...")
                         self._download_process.terminate()
-                        # Wait a bit for termination
                         import time
                         time.sleep(2)
-                        if self._download_process.poll() is None:
-                            print("Process still running, killing...")
-                            self._download_process.kill()
+                        if self._download_process.poll() is None: self._download_process.kill()
                         break
-                
-                    # Check if process finished
-                    if self._download_process.poll() is not None:
-                        break
-                
-                    # Read output line by line to track progress
-                    line = self._download_process.stdout.readline()
-                    if line:
-                        print(f"Download: {line.strip()}")
-                        # Very basic progress parsing - you can enhance this
-                        if "%" in line:
-                            # Extract percentage if possible
-                            import re
-                            match = re.search(r'(\d+)%', line)
-                            if match:
-                                percent = int(match.group(1))
-                                progress = 0.3 + (percent / 100) * 0.7
-                                last_progress = progress
-                                if not update_status(f"Downloading... {percent}%", progress):
-                                    break
-                        else:
-                            # Update status with current line
-                            if not update_status(f"Downloading...", last_progress):
-                                break
-                
-                    # Small delay to prevent busy waiting
-                    import time
-                    time.sleep(0.1)
-            
-                # Process finished or was terminated
+                    chunk = self._download_process.stdout.read(64)
+                    if not chunk:
+                        if self._download_process.poll() is not None: break
+                        import time
+                        time.sleep(0.01)
+                        continue
+                    buffer.extend(chunk)
+                    while b'\r' in buffer or b'\n' in buffer:
+                        r_idx = buffer.find(b'\r')
+                        n_idx = buffer.find(b'\n')
+                        idx = r_idx if r_idx != -1 and (n_idx == -1 or r_idx < n_idx) else n_idx
+                        line_bytes = buffer[:idx]
+                        buffer = buffer[idx + 1:]
+                        try:
+                            line = line_bytes.decode('utf-8', errors='replace').strip()
+                            if line:
+                                if "Fetching" in line and "%" in line:
+                                    import re
+                                    match = re.search(r'(\d+)%', line)
+                                    if match:
+                                        pct = int(match.group(1))
+                                        safe_ui_update("global", text=f"Fetching files... {pct}%")
+                                if "downloading https://" in line and ".incomplete" in line:
+                                    import re
+                                    match = re.search(r'downloading (https://\S+) to (.*\.incomplete)', line)
+                                    if match:
+                                        url = match.group(1)
+                                        filepath = match.group(2)
+                                        if url not in tracked_urls:
+                                            tracked_urls.add(url)
+                                            url_parts = url.split('/')
+                                            filename = f"{url_parts[-2]}/{url_parts[-1]}" if len(url_parts) >= 2 else url_parts[-1]
+                                            def track_progress(dl_url, path, fname):
+                                                import time, os, urllib.request
+                                                try:
+                                                    req = urllib.request.Request(dl_url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
+                                                    with urllib.request.urlopen(req) as response:
+                                                        total_size = int(response.headers.get('Content-Length', 0))
+                                                    if total_size > 0:
+                                                        while not check_cancelled():
+                                                            if os.path.exists(path):
+                                                                current = os.path.getsize(path)
+                                                                percent = current / total_size
+                                                                safe_ui_update("update", filename=fname, progress=percent)
+                                                            else:
+                                                                safe_ui_update("update", filename=fname, progress=1.0)
+                                                                break
+                                                            time.sleep(0.5)
+                                                except Exception: pass
+                                            import threading
+                                            threading.Thread(target=track_progress, args=(url, filepath, filename), daemon=True).start()
+                        except Exception: pass
                 returncode = self._download_process.wait(timeout=5)
-            
                 if check_cancelled():
-                    print("Download was cancelled successfully")
                     self._cleanup_partial_download(model_path)
                     return
-                
                 if returncode == 0:
-                    if not update_status("Download completed successfully!", 1.0):
-                        return
+                    safe_ui_update("global", text="Download completed successfully!")
                     self.after(0, lambda: self.model_var.set(model_path))
                     self.after(2000, dialog.destroy)
-                    self.after(0, lambda: messagebox.showinfo(
-                        "Download Complete", 
-                        f"sd-turbo model downloaded successfully to:\n{model_path}"
-                    ))
+                    self.after(0, lambda: messagebox.showinfo("Download Complete", f"sd-turbo model downloaded successfully to:\n{model_path}"))
                 else:
                     if not check_cancelled():
                         error_msg = f"Download failed with exit code {returncode}"
-                        print(error_msg)
-                        if not update_status(error_msg, 0):
-                            return
-                    
-            except Exception as e:
-                if not check_cancelled():
-                    error_msg = f"Download error: {str(e)}"
-                    print(error_msg)
-                    if not update_status(error_msg, 0):
-                        return
-                    
+                        safe_ui_update("global", text=error_msg)
+            except Exception: pass
             finally:
-                # Ensure process is cleaned up
                 if self._download_process and self._download_process.poll() is None:
                     try:
                         self._download_process.terminate()
                         self._download_process.wait(timeout=2)
                     except:
-                        try:
-                            self._download_process.kill()
-                        except:
-                            pass
+                        try: self._download_process.kill()
+                        except: pass
                 self._download_process = None
-                
-        except Exception as e:
-            if not self._download_cancelled:
-                error_msg = f"Download setup failed: {str(e)}"
-                print(error_msg)
-                try:
-                    self.after(0, lambda: status_label.configure(text=error_msg))
-                    self.after(0, lambda: progress_bar.set(0))
-                except Exception:
-                    pass
+        except Exception: pass
+
     def _toggle_collapse(self):
-        """Toggle between collapsed and expanded view"""
         if self.collapse_var.get():
-            # Expand - show everything
             self.collapse_var.set(False)
             self.collapse_btn.configure(text="📱 Compact")
-            
-            # Show all sections
-            if self.header_frame:
-                self.header_frame.grid(row=0, column=0, sticky="nw", padx=(12, 0), pady=(10, 0))
-            if self.left_panel:
-                self.left_panel.grid(row=1, column=0, sticky="nsew", padx=(12, 0), pady=(6, 6))
-            if self.prompts_row:
-                self.prompts_row.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=12, pady=(0, 8))
-            if self.status_bar:
-                self.status_bar.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
-            
-            # Restore grid weights
-            self.grid_rowconfigure(0, weight=0)  # Header
-            self.grid_rowconfigure(1, weight=1)  # Main content
-            self.grid_rowconfigure(2, weight=0)  # Prompts
-            self.grid_rowconfigure(3, weight=0)  # Status
-            self.grid_columnconfigure(0, weight=0)  # Left panel
-            self.grid_columnconfigure(1, weight=1)  # Right panel
-            
-            # Restore original geometry
+            if self.header_frame: self.header_frame.grid(row=0, column=0, sticky="nw", padx=(12, 0), pady=(10, 0))
+            if self.left_panel: self.left_panel.grid(row=1, column=0, sticky="nsew", padx=(12, 0), pady=(6, 6))
+            if self.prompts_row: self.prompts_row.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=12, pady=(0, 8))
+            if self.status_bar: self.status_bar.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+            self.grid_rowconfigure(0, weight=0); self.grid_rowconfigure(1, weight=1); self.grid_rowconfigure(2, weight=0); self.grid_rowconfigure(3, weight=0); self.grid_columnconfigure(0, weight=0); self.grid_columnconfigure(1, weight=1)
             self.geometry("1180x840")
             self.minsize(1060, 760)
-            
         else:
-            # Collapse - hide left panel and bottom sections
             self.collapse_var.set(True)
             self.collapse_btn.configure(text="📖 Expand")
-            
-            # Hide sections
-            if self.header_frame:
-                self.header_frame.grid_remove()
-            if self.left_panel:
-                self.left_panel.grid_remove()
-            if self.prompts_row:
-                self.prompts_row.grid_remove()
-            if self.status_bar:
-                self.status_bar.grid_remove()
-            
-            # Adjust grid weights for collapsed view
-            self.grid_rowconfigure(0, weight=0)  # No header
-            self.grid_rowconfigure(1, weight=1)  # Only main content
-            self.grid_rowconfigure(2, weight=0)  # No prompts
-            self.grid_rowconfigure(3, weight=0)  # No status
-            self.grid_columnconfigure(0, weight=0)  # No left panel
-            self.grid_columnconfigure(1, weight=1)  # Only right panel
-            
-            # Resize to fit only the preview panel
-            preview_size = self.preview_dim + 150  # Add padding for buttons
+            if self.header_frame: self.header_frame.grid_remove()
+            if self.left_panel: self.left_panel.grid_remove()
+            if self.prompts_row: self.prompts_row.grid_remove()
+            if self.status_bar: self.status_bar.grid_remove()
+            self.grid_rowconfigure(0, weight=0); self.grid_rowconfigure(1, weight=1); self.grid_rowconfigure(2, weight=0); self.grid_rowconfigure(3, weight=0); self.grid_columnconfigure(0, weight=0); self.grid_columnconfigure(1, weight=1)
+            preview_size = self.preview_dim + 150
             self.geometry(f"{preview_size + 50}x{preview_size + 100}")
             self.minsize(preview_size, preview_size)
 
     def _update_collapse_state(self):
-        """Update visibility of UI elements based on collapse state"""
         collapsed = self.collapse_var.get()
-        
-        # Direct references to the main sections we want to hide/show
-        # Left panel (parameters)
         left_panel = None
         for child in self.winfo_children():
-            if isinstance(child, ctk.CTkScrollableFrame) and child._width == 440:  # Left panel
+            if isinstance(child, ctk.CTkScrollableFrame) and child._width == 440:
                 left_panel = child
                 break
-        
-        # Prompts row (bottom section with prompt and negative prompt)
         prompts_row = None
         for child in self.winfo_children():
             if hasattr(child, 'winfo_children') and child.winfo_children():
-                # Look for frames that contain textboxes for prompts
                 for subchild in child.winfo_children():
                     if hasattr(subchild, 'winfo_children') and any('textbox' in str(widget).lower() for widget in subchild.winfo_children()):
                         prompts_row = child
                         break
-                if prompts_row:
-                    break
-        
-        # Status bar (bottom frame)
+                if prompts_row: break
         status_bar = None
         for child in self.winfo_children():
-            if isinstance(child, ctk.CTkFrame) and child._height == 36:  # Status bar
+            if isinstance(child, ctk.CTkFrame) and child._height == 36:
                 status_bar = child
                 break
-        
-        # Header (top left)
         header = None
         for child in self.winfo_children():
-            if child == self.title_label.master:  # The header frame we created
+            if child == self.title_label.master:
                 header = child
                 break
-        
-        # Show/hide elements
         elements_to_toggle = [left_panel, prompts_row, status_bar, header]
-        
         for element in elements_to_toggle:
             if element:
-                if collapsed:
-                    element.grid_remove()
-                else:
-                    element.grid()
-        
-        # Also hide the GPU frame if it exists
+                if collapsed: element.grid_remove()
+                else: element.grid()
         if hasattr(self, 'gpu_frame') and self.gpu_frame:
-            if collapsed:
-                self.gpu_frame.grid_remove()
-            else:
-                self.gpu_frame.grid()
+            if collapsed: self.gpu_frame.grid_remove()
+            else: self.gpu_frame.grid()
 
     def _check_and_hide_gpu_frame(self):
-        """Check if torch is available and hide GPU frame if it is"""
         torch_available = False
-    
         try:
-            import sys
-            import os
-        
-            # Check if torch directory exists
-            torch_dir = INTERNAL_DIR / "torch"
-            if not torch_dir.exists():
-                print(f"[GPU Check] Torch directory not found at: {torch_dir}")
-                return
-        
-            print(f"[GPU Check] Found torch directory: {torch_dir}")
-        
-            # Set up paths
-            internal_str = str(INTERNAL_DIR)
-            if internal_str not in sys.path:
-                sys.path.insert(0, internal_str)
-        
-            # Add DLL paths
+            import sys, os
+            torch_dir = SITE_PACKAGES / "torch" 
+            if not torch_dir.exists(): return
+            site_packages_str = str(SITE_PACKAGES)
+            if site_packages_str not in sys.path: sys.path.insert(0, site_packages_str)
             torch_lib_dir = torch_dir / "lib"
             if torch_lib_dir.exists():
-                try:
-                    os.add_dll_directory(str(torch_lib_dir))
-                    print(f"[GPU Check] Added torch lib to DLL search")
-                except:
-                    pass
-            
+                try: os.add_dll_directory(str(torch_lib_dir))
+                except: pass
                 current_path = os.environ.get("PATH", "")
                 torch_lib_str = str(torch_lib_dir)
-                if torch_lib_str not in current_path:
-                    os.environ["PATH"] = torch_lib_str + os.pathsep + current_path
-        
-            _prime_dll_search()
-        
-            # Now try to import torch (should be clean, first import)
-            print("[GPU Check] Attempting fresh torch import...")
+                if torch_lib_str not in current_path: os.environ["PATH"] = torch_lib_str + os.pathsep + current_path
+            _prime_dll_search(SITE_PACKAGES, INTERNAL_DIR)
             import torch
-        
-            torch_version = torch.__version__
-            print(f"[GPU Check] Torch file: {torch.__file__}")
-            print(f"[GPU Check] ✅ PyTorch {torch_version} detected")
-        
-            try:
-                cuda_available = torch.cuda.is_available()
-                print(f"[GPU Check] CUDA available: {cuda_available}")
-            except Exception as e:
-                print(f"[GPU Check] CUDA check failed: {e}")
-                cuda_available = False
-        
+            try: cuda_available = torch.cuda.is_available()
+            except Exception: cuda_available = False
             torch_available = True
-            
-        except ImportError as e:
-            print(f"[GPU Check] PyTorch import failed: {e}")
-        except Exception as e:
-            print(f"[GPU Check] Error: {e}")
-            import traceback
-            print(f"[GPU Check] Traceback: {traceback.format_exc()}")
-    
+        except Exception: pass
         if torch_available:
             try:
                 if hasattr(self, 'gpu_frame') and self.gpu_frame.winfo_ismapped():
                     self.gpu_frame.grid_remove()
-                    print("[GPU Check] ✅ GPU frame hidden")
-            
                 if hasattr(self, 'status_var'):
                     import torch
                     self.status_var.set(f"GPU runtime ready ✅ (PyTorch {torch.__version__})")
-                    
-            except Exception as e:
-                print(f"[GPU Check] Error hiding frame: {e}")
-        else:
-            print("[GPU Check] ⚠ PyTorch not available")
+            except Exception: pass
 
     def _build_ui(self):
-        # Root grid
-        self.grid_columnconfigure(0, weight=0)
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=0)
-        self.grid_rowconfigure(1, weight=1)
-        self.grid_rowconfigure(2, weight=0)
-        self.grid_rowconfigure(3, weight=0)
-
-        # Header (left column only)
+        self.grid_columnconfigure(0, weight=0); self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=0); self.grid_rowconfigure(1, weight=1); self.grid_rowconfigure(2, weight=0); self.grid_rowconfigure(3, weight=0)
         left_header = ctk.CTkFrame(self, fg_color="transparent")
         left_header.grid(row=0, column=0, sticky="nw", padx=(12, 0), pady=(10, 0))
-
-        left_header.grid_columnconfigure(0, weight=0)
-        left_header.grid_columnconfigure(1, weight=0)
-        left_header.grid_columnconfigure(2, weight=1)
-        left_header.grid_columnconfigure(3, weight=0)
-
+        left_header.grid_columnconfigure(0, weight=0); left_header.grid_columnconfigure(1, weight=0); left_header.grid_columnconfigure(2, weight=1); left_header.grid_columnconfigure(3, weight=0)
         if getattr(self, "logo_img", None):
-            ctk.CTkLabel(left_header, image=self.logo_img, text="")\
-                .grid(row=0, column=0, sticky="w", padx=(0, 8))
-
-        self.title_label = ctk.CTkLabel(
-            left_header,
-            text="Screen Diffusion",
-            font=ctk.CTkFont(size=26, weight="bold"),
-        )
+            ctk.CTkLabel(left_header, image=self.logo_img, text="").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.title_label = ctk.CTkLabel(left_header, text="Screen Diffusion", font=ctk.CTkFont(size=26, weight="bold"))
         self.title_label.grid(row=0, column=1, sticky="w")
-
-        self.version_label = ctk.CTkLabel(
-            left_header,
-            text="Version 0.1",
-            font=ctk.CTkFont(size=14, slant="italic"),
-            text_color="gray70",
-        )
-        self.version_label.grid(row=0, column=3, sticky="e")
+        self.version_label = ctk.CTkLabel(left_header, text="Version 0.2 ", font=ctk.CTkFont(size=14, slant="italic"), text_color="gray70")
+        self.version_label.grid(row=0, column=3, sticky="e", padx=(0, 4))
         self.header_frame = left_header
-        # LEFT (Parameters)
         left = ctk.CTkScrollableFrame(self, width=440, corner_radius=12)
         left.grid(row=1, column=0, sticky="nsew", padx=(12, 0), pady=(6, 6))
         left.grid_columnconfigure(0, weight=1)
         row = 0
-
         if SHOW.get("model_path", True):
-            ctk.CTkLabel(left, text="Model (diffusers folder):", anchor="w")\
-                .grid(row=row, column=0, sticky="ew", pady=(4, 0))
+            ctk.CTkLabel(left, text="Model (diffusers folder):", anchor="w").grid(row=row, column=0, sticky="ew", pady=(4, 0))
             mp = ctk.CTkFrame(left); mp.grid(row=row+1, column=0, sticky="ew")
-            mp.grid_columnconfigure(0, weight=1)
+            mp.grid_columnconfigure(0, weight=1); mp.grid_columnconfigure(1, weight=0); mp.grid_columnconfigure(2, weight=0)
             self._w_model_entry = ctk.CTkEntry(mp, textvariable=self.model_var)
             self._w_model_entry.grid(row=0, column=0, sticky="ew", padx=(0,6), pady=6)
-            self._w_model_browse = ctk.CTkButton(
-                mp, text="Browse", command=self._browse_model, width=90
-            )
-            self._w_model_browse.grid(row=0, column=1, pady=6)
-
-            self._register_lockables(self._w_model_entry, self._w_model_browse)
+            self._w_model_browse = ctk.CTkButton(mp, text="Browse", command=self._browse_model, width=70)
+            self._w_model_browse.grid(row=0, column=1, padx=(0,6), pady=6)
+            self._w_model_download = ctk.CTkButton(mp, text="⬇ Download SD-Turbo", command=self._download_sd_turbo, width=140, fg_color="#10B981", hover_color="#059669")
+            self._w_model_download.grid(row=0, column=2, pady=6)
+            self._register_lockables(self._w_model_entry, self._w_model_browse, self._w_model_download)
             row += 2
-
-        
         g2 = ctk.CTkFrame(left); g2.grid(row=row, column=0, sticky="ew", pady=(4,6))
         for i in range(6): g2.grid_columnconfigure(i, weight=1)
         col = 0
@@ -2309,9 +1331,7 @@ class StreamGUI(ctk.CTk):
             self._register_lockables(self._w_buffer_entry)
         if SHOW.get("acceleration", True):
             ctk.CTkLabel(g2, text="Acceleration").grid(row=0, column=col, sticky="w")
-            self._w_accel_combo = ctk.CTkComboBox(
-                g2, values=["none","xformers"], variable=self.accel_var, width=120
-            )
+            self._w_accel_combo = ctk.CTkComboBox(g2, values=["none", "xformers", "tensorrt"], variable=self.accel_var, width=120)
             self._w_accel_combo.grid(row=1, column=col, sticky="ew"); col += 1
             self._register_lockables(self._w_accel_combo)
         if SHOW.get("use_denoising_batch", True):
@@ -2319,46 +1339,56 @@ class StreamGUI(ctk.CTk):
             self._w_denoise_switch.grid(row=1, column=col, sticky="w"); col += 1
             self._register_lockables(self._w_denoise_switch)
         row += 1
-
-        g3 = ctk.CTkFrame(left); g3.grid(row=row, column=0, sticky="ew", pady=(4,6))
+        g3 = ctk.CTkFrame(left); g3.grid(row=row, column=0, sticky="ew", pady=(4,6)); g3.grid_remove()
         for i in range(6): g3.grid_columnconfigure(i, weight=1)
         col = 0
-        if SHOW.get("cfg_type", True):
+        if SHOW.get("cfg_type", False):
             ctk.CTkLabel(g3, text="CFG type").grid(row=0, column=col, sticky="w")
-            self._w_cfg_combo = ctk.CTkComboBox(
-                g3, values=["none","full","self","initialize"], variable=self.cfg_type_var, width=120
-            )
+            self._w_cfg_combo = ctk.CTkComboBox(g3, values=["none","full","self","initialize"], variable=self.cfg_type_var, width=120)
             self._w_cfg_combo.grid(row=1, column=col, sticky="ew"); col += 1
             self._register_lockables(self._w_cfg_combo)
-        if SHOW.get("guidance_scale", True):
+        if SHOW.get("guidance_scale", False):
             ctk.CTkLabel(g3, text="Guidance").grid(row=0, column=col, sticky="w")
             self._w_guidance_entry = ctk.CTkEntry(g3, textvariable=self.guidance_var, width=70)
             self._w_guidance_entry.grid(row=1, column=col, sticky="ew"); col += 1
             self._register_lockables(self._w_guidance_entry)
-        if SHOW.get("delta", True):
+        if SHOW.get("delta", False):
             ctk.CTkLabel(g3, text="Delta").grid(row=0, column=col, sticky="w")
             self._w_delta_entry = ctk.CTkEntry(g3, textvariable=self.delta_var, width=70)
             self._w_delta_entry.grid(row=1, column=col, sticky="ew"); col += 1
             self._register_lockables(self._w_delta_entry)
-        if SHOW.get("offline", True):
+        if SHOW.get("offline", False):
             self._w_offline_switch = ctk.CTkSwitch(g3, text="Offline", variable=self.offline_var)
             self._w_offline_switch.grid(row=1, column=col, sticky="w"); col += 1
             self._register_lockables(self._w_offline_switch)
         row += 1
-        self.left_panel = left
-        # Steps
-        steps = ctk.CTkFrame(left); steps.grid(row=row, column=0, sticky="ew", pady=(4,6))
-        steps.grid_columnconfigure(0, weight=1)
+        # --- SECTION 3: Step Sliders (Bottom - Takes up remaining space) ---
+        steps_frame = ctk.CTkFrame(left, fg_color="transparent")
+        # FIX: Use .grid() here to match g3 and sim!
+        steps_frame.grid(row=row, column=0, sticky="nsew", padx=10, pady=10) 
 
-        # Simple header without add/remove buttons
-        ctk.CTkLabel(steps, text="Denoising Step", anchor="w").grid(row=0, column=0, sticky="w", pady=(0,4))
+        # Header row for the title and the buttons (These can use pack because they are INSIDE steps_frame)
+        step_header = ctk.CTkFrame(steps_frame, fg_color="transparent")
+        step_header.pack(fill="x", pady=(0, 5))
 
-        self._steps_holder = ctk.CTkFrame(steps)
-        self._steps_holder.grid(row=1, column=0, sticky="ew", pady=(6,0))
+        ctk.CTkLabel(step_header, text="Denoising Steps", font=ctk.CTkFont(weight="bold")).pack(side="left")
+
+        # Add Step Button
+        btn_add = ctk.CTkButton(step_header, text="+ Add", width=50, command=self._add_step)
+        btn_add.pack(side="right", padx=(5,0))
+        self._register_lockables(btn_add)
+
+        # Remove Step Button
+        btn_rm = ctk.CTkButton(step_header, text="- Remove", width=60, command=self._remove_step)
+        btn_rm.pack(side="right")
+        self._register_lockables(btn_rm)
+
+        # Container for the dynamic sliders
+        self._steps_holder = ctk.CTkFrame(steps_frame)
+        self._steps_holder.pack(fill="both", expand=True, pady=5)
         self._build_steps_ui()
         row += 1
-
-        if SHOW.get("similar_image_filter", True):
+        if SHOW.get("similar_image_filter", False):
             sim = ctk.CTkFrame(left); sim.grid(row=row, column=0, sticky="ew", pady=(4,6))
             sim.grid_columnconfigure(0, weight=0); sim.grid_columnconfigure(1, weight=1)
             ctk.CTkLabel(sim, text="Similar Image Filter").grid(row=0, column=0, sticky="w", pady=(0,4))
@@ -2367,132 +1397,46 @@ class StreamGUI(ctk.CTk):
             self._w_sim_maxskip = ctk.CTkEntry(sim, textvariable=self.sim_maxskip_var, width=80); self._w_sim_maxskip.grid(row=3, column=1, sticky="w", padx=(6,0))
             self._register_lockables(self._w_sim_switch, self._w_sim_thresh, self._w_sim_maxskip)
             row += 1
-
-        # GPU Add-On
-        self.gpu_frame = ctk.CTkFrame(left)
-        self.gpu_frame.grid(row=row, column=0, sticky="ew", pady=(6,6))
-        self.gpu_frame.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(self.gpu_frame, text="GPU Add-On").grid(row=0, column=0, sticky="w")
-        self.gpu_btn = ctk.CTkButton(self.gpu_frame, text="Enable GPU (download ~ 2.8GB)", command=self._on_enable_gpu)
-        self.gpu_btn.grid(row=1, column=0, sticky="ew", pady=(4,2))
-        self.gpu_log = ctk.CTkTextbox(self.gpu_frame, height=80)
-        self.gpu_log.grid(row=2, column=0, sticky="ew")
-        self.gpu_log.configure(state="disabled")
-        self.gpu_log.configure(state="normal"); self.gpu_log.insert("end", "Log ready…\n"); self.gpu_log.configure(state="disabled")
-        row += 1
-
-        # RIGHT (Preview)
         right = ctk.CTkFrame(self, corner_radius=12)
         right.grid(row=1, column=1, sticky="nsew", padx=(6, 12), pady=(6, 6))
-        right.grid_rowconfigure(0, weight=0)
-        right.grid_rowconfigure(1, weight=1)
-        right.grid_rowconfigure(2, weight=0)
-        right.grid_columnconfigure(0, weight=1)
-
+        right.grid_rowconfigure(0, weight=0); right.grid_rowconfigure(1, weight=1); right.grid_rowconfigure(2, weight=0); right.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(right, text="Preview").grid(row=0, column=0, sticky="w", padx=12, pady=(12, 0))
         self.preview_container = ctk.CTkFrame(right, corner_radius=8, width=self.preview_dim, height=self.preview_dim)
         self.preview_container.grid(row=1, column=0, sticky="n", padx=12, pady=(8, 12))
         self.preview_container.grid_propagate(False)
         self._photo = CTkImage(light_image=Image.new("RGB", (self.preview_dim, self.preview_dim)),size=(self.preview_dim, self.preview_dim))
-        
         self.preview_panel = ctk.CTkLabel(self.preview_container, image=self._photo, text="")
         self.preview_panel.place(x=0, y=0)
-
-                # Action buttons
         actions = ctk.CTkFrame(right, fg_color="transparent")
         actions.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 16))
-        actions.grid_columnconfigure(0, weight=1)
-        actions.grid_columnconfigure(1, weight=0)
-        actions.grid_columnconfigure(2, weight=1)
-
+        actions.grid_columnconfigure(0, weight=1); actions.grid_columnconfigure(1, weight=0); actions.grid_columnconfigure(2, weight=1)
         button_container = ctk.CTkFrame(actions, fg_color="transparent")
         button_container.grid(row=0, column=1, sticky="ew")
-
-        self.start_btn = ctk.CTkButton(
-            button_container, 
-            text="🚀 Start Generation",
-            command=self._on_start, 
-            width=140,
-            height=36,
-            fg_color=CUSTOM_COLORS["success"],
-            hover_color="#059669",
-            corner_radius=8,
-            font=ctk.CTkFont(weight="bold")
-        )
+        self.start_btn = ctk.CTkButton(button_container, text="🚀 Start Generation", command=self._on_start, width=140, height=36, fg_color=CUSTOM_COLORS["success"], hover_color="#059669", corner_radius=8, font=ctk.CTkFont(weight="bold"))
         self.start_btn.grid(row=0, column=0, padx=(0, 8))
-
-        self.stop_btn = ctk.CTkButton(
-            button_container, 
-            text="⏹ Stop", 
-            command=self._on_stop, 
-            width=100,
-            height=36,
-            fg_color=CUSTOM_COLORS["error"],
-            hover_color="#DC2626",
-            corner_radius=8,
-            font=ctk.CTkFont(weight="bold")
-        )
+        self.stop_btn = ctk.CTkButton(button_container, text="⏹ Stop", command=self._on_stop, width=100, height=36, fg_color=CUSTOM_COLORS["error"], hover_color="#DC2626", corner_radius=8, font=ctk.CTkFont(weight="bold"))
         self.stop_btn.grid(row=0, column=1, padx=(0, 8))
         self.stop_btn.configure(state="disabled")
-
-        self.hide_capture_btn = ctk.CTkButton(
-            button_container, 
-            text="👁 Hide (H)", 
-            command=self._toggle_capture_window, 
-            width=100,
-            height=36,
-            fg_color="#6B7280",
-            hover_color="#4B5563",
-            corner_radius=8,
-            font=ctk.CTkFont(weight="bold")
-        )
+        self.hide_capture_btn = ctk.CTkButton(button_container, text="👁 Hide (H)", command=self._toggle_capture_window, width=100, height=36, fg_color="#6B7280", hover_color="#4B5563", corner_radius=8, font=ctk.CTkFont(weight="bold"))
         self.hide_capture_btn.grid(row=0, column=2, padx=(0, 8))
         self.hide_capture_btn.configure(state="disabled")
-
-        # Collapse/Expand button
-        self.collapse_btn = ctk.CTkButton(
-            button_container, 
-            text="📱 Compact", 
-            command=self._toggle_collapse, 
-            width=100,
-            height=36,
-            fg_color="#6B7280",
-            hover_color="#4B5563",
-            corner_radius=8,
-            font=ctk.CTkFont(weight="bold")
-        )
+        self.collapse_btn = ctk.CTkButton(button_container, text="📱 Compact", command=self._toggle_collapse, width=100, height=36, fg_color="#6B7280", hover_color="#4B5563", corner_radius=8, font=ctk.CTkFont(weight="bold"))
         self.collapse_btn.grid(row=0, column=3, padx=(0, 8)) 
-
-        ctk.CTkButton(
-            button_container, 
-            text="❌ Quit", 
-            command=self.do_quit, 
-            width=100,
-            height=36,
-            fg_color=CUSTOM_COLORS["surface"],
-            hover_color=CUSTOM_COLORS["error"],
-            corner_radius=8,
-            font=ctk.CTkFont(weight="bold")
-        ).grid(row=0, column=4)
-
-        # Prompts row (spans both columns)
+        ctk.CTkButton(button_container, text="❌ Quit", command=self.do_quit, width=100, height=36, fg_color=CUSTOM_COLORS["surface"], hover_color=CUSTOM_COLORS["error"], corner_radius=8, font=ctk.CTkFont(weight="bold")).grid(row=0, column=4)
         prompts_row = ctk.CTkFrame(self)
         prompts_row.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=12, pady=(0, 8))
         prompts_row.grid_columnconfigure(0, weight=1); prompts_row.grid_columnconfigure(1, weight=1); prompts_row.grid_rowconfigure(0, weight=1)
-
         prompt_frame = ctk.CTkFrame(prompts_row, corner_radius=10); prompt_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
         prompt_frame.grid_rowconfigure(1, weight=1); prompt_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(prompt_frame, text="Prompt", anchor="w").grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 0))
         self.prompt_txt = ctk.CTkTextbox(prompt_frame, height=120); self.prompt_txt.grid(row=1, column=0, sticky="nsew", padx=10, pady=(4, 10))
         self.prompt_txt.delete("1.0", "end"); self.prompt_txt.insert("1.0", self.prompt_var.get()); self.prompt_txt.bind("<KeyRelease>", self._on_prompt_changed)
-
         neg_frame = ctk.CTkFrame(prompts_row, corner_radius=10); neg_frame.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
         neg_frame.grid_rowconfigure(1, weight=1); neg_frame.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(neg_frame, text="Negative Prompt", anchor="w").grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 0))
         self.neg_prompt_txt = ctk.CTkTextbox(neg_frame, height=120); self.neg_prompt_txt.grid(row=1, column=0, sticky="nsew", padx=10, pady=(4, 10))
         self.neg_prompt_txt.delete("1.0", "end"); self.neg_prompt_txt.insert("1.0", self.neg_prompt_var.get()); self.neg_prompt_txt.bind("<KeyRelease>", self._on_neg_prompt_changed)
         self.prompts_row = prompts_row
-        # Status bar
         status = ctk.CTkFrame(self, height=36, corner_radius=12)
         status.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
         status.grid_columnconfigure(0, weight=0); status.grid_columnconfigure(1, weight=1)
@@ -2500,71 +1444,46 @@ class StreamGUI(ctk.CTk):
         ctk.CTkLabel(status, textvariable=self.fps_var).grid(row=0, column=0, sticky="w", padx=12)
         ctk.CTkLabel(status, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=12)
         self.status_bar = status
+
     def _validate_numeric_parameters(self):
-        """Validate all numeric parameters before starting"""
         try:
             seed_str = self.seed_var.get().strip()
-            if seed_str == "":
-                seed = 1
+            if seed_str == "": seed = 1
             else:
                 seed = int(seed_str)
-                if seed < 0:
-                    messagebox.showwarning("Warning", "Seed should be non-negative. Using 0.")
-                    seed = 0
+                if seed < 0: seed = 0
             self.seed_var.set(str(seed))
-
             buffer_str = self.buffer_var.get().strip()
-            if buffer_str == "":
-                buffer_size = 1
+            if buffer_str == "": buffer_size = 1
             else:
                 buffer_size = int(buffer_str)
-                if buffer_size < 1:
-                    messagebox.showwarning("Warning", "Buffer size must be at least 1. Using 1.")
-                    buffer_size = 1
+                if buffer_size < 1: buffer_size = 1
             self.buffer_var.set(str(buffer_size))
-
             guidance_str = self.guidance_var.get().strip()
-            if guidance_str == "":
-                guidance = 0.0
+            if guidance_str == "": guidance = 0.0
             else:
                 guidance = float(guidance_str)
-                if guidance < 0:
-                    messagebox.showwarning("Warning", "Guidance scale should be non-negative. Using 0.")
-                    guidance = 0.0
+                if guidance < 0: guidance = 0.0
             self.guidance_var.set(str(guidance))
-
             delta_str = self.delta_var.get().strip()
-            if delta_str == "":
-                delta = 0.0
+            if delta_str == "": delta = 0.0
             else:
                 delta = float(delta_str)
-                if delta < 0:
-                    messagebox.showwarning("Warning", "Delta should be non-negative. Using 0.")
-                    delta = 0.0
+                if delta < 0: delta = 0.0
             self.delta_var.set(str(delta))
-
             sim_thresh_str = self.sim_thresh_var.get().strip()
-            if sim_thresh_str == "":
-                sim_thresh = 0.99
+            if sim_thresh_str == "": sim_thresh = 0.99
             else:
                 sim_thresh = float(sim_thresh_str)
-                if not (0.0 <= sim_thresh <= 1.0):
-                    messagebox.showwarning("Warning", "Similarity threshold should be between 0.0 and 1.0. Using 0.99.")
-                    sim_thresh = 0.99
+                if not (0.0 <= sim_thresh <= 1.0): sim_thresh = 0.99
             self.sim_thresh_var.set(str(sim_thresh))
-
             sim_maxskip_str = self.sim_maxskip_var.get().strip()
-            if sim_maxskip_str == "":
-                sim_maxskip = 10.0
+            if sim_maxskip_str == "": sim_maxskip = 10.0
             else:
                 sim_maxskip = float(sim_maxskip_str)
-                if sim_maxskip < 0:
-                    messagebox.showwarning("Warning", "Max skip frames should be non-negative. Using 10.")
-                    sim_maxskip = 10.0
+                if sim_maxskip < 0: sim_maxskip = 10.0
             self.sim_maxskip_var.set(str(sim_maxskip))
-
             return True
-
         except ValueError as e:
             messagebox.showerror("Validation Error", f"Invalid numeric value: {e}")
             return False
@@ -2593,33 +1512,33 @@ class StreamGUI(ctk.CTk):
 
     def _add_step(self):
         if self.running: return
-        self.t_index_list.append(30)
+        # Automatically make the new step 10 less than the last one to prevent duplicates
+        last_val = self.t_index_list[-1] if self.t_index_list else 40
+        new_val = max(2, last_val - 10)
+        
+        self.t_index_list.append(new_val)
         self._build_steps_ui()
+        if self.running: 
+            try: self.control_q.put_nowait({"type": "set_t_index_list", "t_index_list": list(self.t_index_list)})
+            except Exception: pass
 
     def _remove_step(self):
         if len(self.t_index_list) > 1:
             self.t_index_list.pop()
             self._build_steps_ui()
             if self.running: 
-                try:
-                    self.control_q.put_nowait({"type": "set_t_index_list", "t_index_list": list(self.t_index_list)})
-                except Exception:
-                    pass
+                try: self.control_q.put_nowait({"type": "set_t_index_list", "t_index_list": list(self.t_index_list)})
+                except Exception: pass
 
     def _build_steps_ui(self):
         for child in self._steps_holder.winfo_children(): child.destroy()
         self._step_sliders = []
         for idx, val in enumerate(self.t_index_list):
             row = idx
-            ctk.CTkLabel(self._steps_holder, text=f"Step {idx+1}")\
-                .grid(row=row, column=0, sticky="w", padx=(0,6), pady=4)
+            ctk.CTkLabel(self._steps_holder, text=f"Step {idx+1}").grid(row=row, column=0, sticky="w", padx=(0,6), pady=4)
             disp = ctk.StringVar(value=str(int(val)))
-            ctk.CTkLabel(self._steps_holder, textvariable=disp, width=28)\
-                .grid(row=row, column=1, sticky="w", padx=(0,6))
-            slider = ctk.CTkSlider(
-                self._steps_holder, from_=2, to=49, number_of_steps=48,
-                command=lambda v, i=idx, d=disp: self._on_step_changed(i, v, d)
-            )
+            ctk.CTkLabel(self._steps_holder, textvariable=disp, width=28).grid(row=row, column=1, sticky="w", padx=(0,6))
+            slider = ctk.CTkSlider(self._steps_holder, from_=2, to=49, number_of_steps=48, command=lambda v, i=idx, d=disp: self._on_step_changed(i, v, d))
             slider.set(int(val))
             slider.grid(row=row, column=2, sticky="ew", padx=(0,6))
             self._step_sliders.append(slider)
@@ -2631,14 +1550,19 @@ class StreamGUI(ctk.CTk):
             ival = max(2, min(49, int(float(v))))
         except Exception:
             return
-
+    
         disp_var.set(str(ival))
+    
+        # Update just the value that changed — no sorting, no reordering
         if 0 <= index < len(self.t_index_list):
             self.t_index_list[index] = ival
 
         if self.running and getattr(self, 'control_q', None):
             try:
-                self.control_q.put_nowait({"type": "set_t_at", "index": int(index), "value": int(ival)})
+                self.control_q.put_nowait({
+                    "type": "set_t_index_list",
+                    "t_index_list": list(self.t_index_list)
+                })
             except Exception:
                 pass
 
@@ -2671,25 +1595,21 @@ class StreamGUI(ctk.CTk):
         except Exception: pass
 
     def _overlay_screen_rect(self) -> Dict[str, int]:
-        if self.capwin is not None:
-            return self.capwin.inner_rect_screen()
+        if self.capwin is not None: return self.capwin.inner_rect_screen()
         self.update_idletasks()
         x = int(self.preview_panel.winfo_rootx()); y = int(self.preview_panel.winfo_rooty())
         return {"left": x, "top": y, "width": self.preview_dim, "height": self.preview_dim}
 
     def _send_region_update(self):
         if self.running and getattr(self, "control_q", None):
-            try:
-                self.control_q.put_nowait({"type": "set_region", "region": self._overlay_screen_rect()})
+            try: self.control_q.put_nowait({"type": "set_region", "region": self._overlay_screen_rect()})
             except Exception: pass
 
     def _on_window_configure(self, _evt=None):
         if self.running and self.capwin is not None:
             try:
-                if self._debounce_region is not None: 
-                    self.after_cancel(self._debounce_region)
-            except Exception: 
-                pass
+                if self._debounce_region is not None: self.after_cancel(self._debounce_region)
+            except Exception: pass
             self._debounce_region = self.after(50, self._send_region_update)
 
     def _append_gpu_log(self, line: str):
@@ -2707,99 +1627,60 @@ class StreamGUI(ctk.CTk):
             self.gpu_pct_var.set(f"{int(round(f*100))}%")
             try: self.update_idletasks()
             except Exception: pass
-        except Exception:
-            pass
+        except Exception: pass
 
     def _on_enable_gpu(self):
         if getattr(self, "_gpu_install_in_progress", False):
-            try:
-                self.gpu_btn.configure(state="disabled")
-            except Exception:
-                pass
+            try: self.gpu_btn.configure(state="disabled")
+            except Exception: pass
             return
-
-        try:
-            self.gpu_btn.configure(state="disabled", text="Installing PyTorch...")
-        except Exception:
-            pass
-
+        try: self.gpu_btn.configure(state="disabled", text="Installing PyTorch...")
+        except Exception: pass
         self._gpu_install_in_progress = True
         self._append_gpu_log("Starting PyTorch installation...")
         self._gpu_prog_set(0.05)
-
         def progress_callback(progress, status=""):
             self._gpu_prog_set(progress)
-            if status:
-                self._append_gpu_log(status)
-
+            if status: self._append_gpu_log(status)
         def worker():
             try:
-                def on_progress(line: str):
-                    self._append_gpu_log(line)
-
+                def on_progress(line: str): self._append_gpu_log(line)
                 self._append_gpu_log("Installing PyTorch with CUDA support...")
                 self._gpu_prog_set(0.05)
-
-                _patch_missing_modules()
-                _patch_torch_imports()
-
-                # Install only PyTorch
                 success = maybe_bootstrap_gpu(on_progress=on_progress, progress_callback=progress_callback)
-        
                 if success:
-                    self._append_gpu_log("✅ PyTorch installation completed successfully!")
-                    self._append_gpu_log("🔄 Restarting application in 3 seconds...")
-            
-                    # Schedule automatic restart
+                    self._append_gpu_log("PyTorch installation completed successfully!")
+                    self._append_gpu_log("Restarting application in 3 seconds...")
                     self.after(3000, self._perform_automatic_restart)
                 else:
-                    self._append_gpu_log("❌ PyTorch installation failed")
+                    self._append_gpu_log("PyTorch installation failed")
                     self._gpu_prog_set(0.0)
-                    try:
-                        self.gpu_btn.configure(state="normal", text="Install PyTorch - RETRY")
-                    except Exception:
-                        pass
-
+                    try: self.gpu_btn.configure(state="normal", text="Install PyTorch - RETRY")
+                    except Exception: pass
             except Exception as e:
-                self._append_gpu_log(f"❌ Installation failed: {e}")
-                import traceback
-                self._append_gpu_log(f"Traceback: {traceback.format_exc()}")
+                self._append_gpu_log(f"Installation failed: {e}")
                 self._gpu_prog_set(0.0)
-                try:
-                    self.gpu_btn.configure(state="normal", text="Install PyTorch - RETRY")
-                except Exception:
-                    pass
+                try: self.gpu_btn.configure(state="normal", text="Install PyTorch - RETRY")
+                except Exception: pass
             finally:
                 self._gpu_install_in_progress = False
-
         import threading
         t = threading.Thread(target=worker, daemon=True)
         t.start()
 
     def _perform_automatic_restart(self):
-        """Perform automatic restart"""
         try:
-            self._append_gpu_log("🔄 Restarting application now...")
+            self._append_gpu_log("Restarting application now...")
             self.update_idletasks()
-        
-            # Ensure _internal is in sys.path before restarting
             import sys
             internal_str = str(INTERNAL_DIR)
-            if internal_str not in sys.path:
-                sys.path.insert(0, internal_str)
-        
+            if internal_str not in sys.path: sys.path.insert(0, internal_str)
             import time
             time.sleep(1)
-        
             _gpu_relaunch_into_runtime()
         except Exception as e:
-            self._append_gpu_log(f"❌ Automatic restart failed: {e}")
-            self._append_gpu_log("Please manually restart the application")
-            messagebox.showinfo(
-                "Restart Required", 
-                "PyTorch installed successfully!\n\nPlease manually restart the application to use GPU features."
-            )
-
+            self._append_gpu_log(f"Automatic restart failed: {e}")
+            messagebox.showinfo("Restart Required", "PyTorch installed successfully!\n\nPlease manually restart the application to use GPU features.")
 
     def _browse_model(self):
         d = filedialog.askdirectory(title="Select diffusers model folder")
@@ -2807,49 +1688,32 @@ class StreamGUI(ctk.CTk):
 
     def _on_start(self):
         if self.running: return
-
-        if not self._validate_numeric_parameters():
-            return
-
-        try:
-            verify_local_model_path_dir(self.model_var.get())
-        except Exception as e:
-            messagebox.showerror("Paths error", str(e)); return
-
+        if not self._validate_numeric_parameters(): return
+        try: verify_local_model_path_dir(self.model_var.get())
+        except Exception as e: messagebox.showerror("Paths error", str(e)); return
         ctx = get_context("spawn")
         self.proc_ctx = ctx
         self.out_q = ctx.Queue(maxsize=2); self.fps_q = ctx.Queue(); self.status_q = ctx.Queue()
         self.control_q = ctx.Queue(); self.debug_q = ctx.Queue(); self.close_q = ctx.Queue()
         self.monitor_sender, self.monitor_receiver = ctx.Pipe()
-
         controlnet_paths: List[str] = []; controlnet_scales: List[float] = []
-
         self.proc_worker = ctx.Process(
             target=image_generation_process,
             args=(
-                self.out_q, self.fps_q, self.close_q, self.status_q, self.control_q, self.debug_q,
-                list(map(int, self.t_index_list)),
-                self.model_var.get(), controlnet_paths, controlnet_scales, None,
-                self.prompt_txt.get("1.0", "end").strip(),
-                self.neg_prompt_txt.get("1.0", "end").strip(),
-                int(self.buffer_var.get()),
-                int(self.width_var.get()), int(self.height_var.get()),
-                self.accel_var.get(), bool(self.denoise_batch_var.get()),
-                int(self.seed_var.get()), self.cfg_type_var.get(),
-                float(self.guidance_var.get()), float(self.delta_var.get()),
-                False, bool(self.sim_filter_var.get()),
-                float(self.sim_thresh_var.get()), float(self.sim_maxskip_var.get()),
-                self.monitor_receiver, bool(self.offline_var.get()),
-            ),
+                self.out_q, self.fps_q, self.close_q, self.status_q, self.control_q, self.debug_q, 
+                list(map(int, self.t_index_list)), self.model_var.get(), controlnet_paths, controlnet_scales, 
+                None, 
+                self.prompt_txt.get("1.0", "end").strip(), self.neg_prompt_txt.get("1.0", "end").strip(), 
+                int(self.buffer_var.get()), int(self.width_var.get()), int(self.height_var.get()), 
+                self.accel_var.get(), True, int(self.seed_var.get()), 
+                "none", 0.0, 0.5, True, False, 0.99, 10.0,  # <-- Changed the first 'False' to 'True' here!
+                self.monitor_receiver, True
+            )
         )
         self.proc_worker.start()
-
         self.capwin = FloatingCaptureWindow(self, inner_size=self.preview_dim, border_px=8, handle_h=28)
-        try:
-            self.monitor_sender.send(self._overlay_screen_rect())
-        except Exception as e:
-            print(f"[gui] failed to send capture rect: {e}")
-
+        try: self.monitor_sender.send(self._overlay_screen_rect())
+        except Exception: pass
         self.running = True
         self.start_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
         self.hide_capture_btn.configure(state="normal")
@@ -2868,12 +1732,9 @@ class StreamGUI(ctk.CTk):
         finally:
             try:
                 if self.capwin is not None:
-                    # Show window before destroying if it was hidden
                     try:
-                        if self.capwin.win.state() != "normal":
-                            self.capwin.win.deiconify()
-                    except:
-                        pass
+                        if self.capwin.win.state() != "normal": self.capwin.win.deiconify()
+                    except: pass
                     self.capwin.destroy()
             finally:
                 self.capwin = None
@@ -2903,89 +1764,59 @@ class StreamGUI(ctk.CTk):
                     msg = self.status_q.get_nowait()
                     self.status_var.set(msg)
             except Exception: pass
-        self.after(33, self._poll_queues)
+            
+        poll_delay = 10 if self.accel_var.get() == "tensorrt" else 33
+        self.after(poll_delay, self._poll_queues)
 
     def _update_preview(self, pil_img: Image):
         dim = self.preview_dim
-    
         canvas = Image.new("RGB", (dim, dim), (30, 30, 30))
-    
         img = pil_img.copy()
         img.thumbnail((dim, dim), PIL.Image.BICUBIC)
         x = (dim - img.width) // 2
         y = (dim - img.height) // 2
         canvas.paste(img, (x, y))
-    
         self._ctk_img = ctk.CTkImage(light_image=canvas, dark_image=canvas, size=(dim, dim))
         self.preview_panel.configure(image=self._ctk_img)
 
     def do_quit(self):
-        if not messagebox.askyesno("Quit", "Are you sure you want to quit and stop all workers?"):
-            return
+        if not messagebox.askyesno("Quit", "Are you sure you want to quit and stop all workers?"): return
         if self.running: self._on_stop()
         self.destroy()
 
-# =========================
-# Main
-# =========================
 def preload_critical_components():
-    """Preload components but skip torch in frozen mode"""
     if not getattr(sys, "frozen", False):
-        # Only preload in dev mode
-        _prime_dll_search()
+        _prime_dll_search(SITE_PACKAGES, INTERNAL_DIR)
         PreloadedDependencies.preload_all()
-    else:
-        print("[Preload] Skipping torch preload in frozen mode (will load on-demand)")
 
 if __name__ == "__main__":
     try:
-        print("=== APPLICATION STARTING ===")
         import multiprocessing as mp
         mp.freeze_support()
-        
         preload_critical_components()
-        
-        print("Creating GUI...")
         app = StreamGUI()
-        print("GUI created successfully, starting mainloop...")
         
-        # Additional icon setting as backup
         def set_window_icon_backup():
-            """Backup method to set window icon"""
             try:
-                icon_paths = [
-                    resource_path("icon2.ico"),
-                ]
-                
+                icon_paths = [resource_path("icon2.ico")]
                 for icon_path in icon_paths:
                     if os.path.exists(icon_path):
                         if icon_path.lower().endswith('.ico'):
                             app.iconbitmap(icon_path)
-                            print(f"Backup icon set from: {icon_path}")
                             break
                         else:
-                            # Convert image to temporary .ico
                             try:
                                 img = Image.open(icon_path)
                                 img = img.resize((32, 32), Image.Resampling.LANCZOS)
                                 temp_ico = os.path.join(tempfile.gettempdir(), "temp_app_icon.ico")
                                 img.save(temp_ico, format='ICO')
                                 app.iconbitmap(temp_ico)
-                                print(f"Converted and set icon from: {icon_path}")
                                 break
-                            except Exception:
-                                continue
-            except Exception as e:
-                print(f"Backup icon setting failed: {e}")
+                            except Exception: continue
+            except Exception: pass
         
-        # Run backup icon setting after a short delay
         app.after(500, set_window_icon_backup)
-        
         app.mainloop()
-        print("=== APPLICATION EXITED ===")
         
-    except Exception as e:
-        print(f"!!! CRITICAL ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        input("Press Enter to exit...")
+    except Exception:
+        pass

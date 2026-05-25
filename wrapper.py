@@ -12,10 +12,17 @@ from PIL import Image
 from streamdiffusion import StreamDiffusion
 from streamdiffusion.image_utils import postprocess_image
 
+from diffusers import AutoencoderTiny, StableDiffusionPipeline
+from PIL import Image
+
+from streamdiffusion import StreamDiffusion
+from streamdiffusion.image_utils import postprocess_image
+
 
 torch.set_grad_enabled(False)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True  # Add this flag
 
 
 def _broadcast_list(vals: Optional[List[float]], n: int, default: float = 1.0) -> List[float]:
@@ -222,6 +229,11 @@ class StreamDiffusionWrapper:
         a native setter, use it; otherwise patch step-dependent caches.
         """
         new_steps = [int(max(1, min(49, int(v)))) for v in list(new_steps)]
+        
+        # Stop redundant rebuilds from slider spam!
+        if hasattr(self, 't_index_list') and self.t_index_list == new_steps:
+            return 
+            
         self.t_index_list = list(new_steps)
     
         # Try native methods first
@@ -568,6 +580,8 @@ class StreamDiffusionWrapper:
         try:  # Load from local directory
             pipe: StableDiffusionPipeline = StableDiffusionPipeline.from_pretrained(
                 model_id_or_path,
+                variant="fp16",
+                use_safetensors=True,
             ).to(device=self.device, dtype=self.dtype)
 
         except ValueError:  # Load from huggingface
@@ -618,9 +632,96 @@ class StreamDiffusionWrapper:
 
         try:
             if acceleration == "xformers":
-                stream.pipe.enable_xformers_memory_efficient_attention()
+                print("[INFO] Bypassing broken xformers... Using PyTorch Native Flash Attention (SDPA) instead!")
+                # Modern diffusers natively default to SDPA on PyTorch 2.0+, so no extra code is needed here.
             if acceleration == "tensorrt":
                 from polygraphy import cuda
+                # ---- Polygraphy compatibility shim for StreamDiffusion TensorRT engines ----
+                # Some Polygraphy versions (0.48+ / 0.49+ / newer NVIDIA wheels)
+                # do not expose trt_util.get_bindings_per_profile(), but StreamDiffusion's
+                # TensorRT Engine classes still call it during inference.
+                from polygraphy.backend.trt import util as trt_util
+                if not hasattr(trt_util, "get_bindings_per_profile"):
+                    def _sd_get_bindings_per_profile(engine):
+                        profiles = int(getattr(engine, "num_optimization_profiles", 1) or 1)
+
+                        # TensorRT 8.x binding API
+                        if hasattr(engine, "num_bindings"):
+                            return int(engine.num_bindings) // profiles
+
+                        # TensorRT 10.x named I/O tensor API fallback.
+                        # This only fixes the missing Polygraphy helper. If the installed
+                        # TensorRT build has removed other binding APIs used by StreamDiffusion,
+                        # pin TensorRT to an 8.x/9.x build or port StreamDiffusion's engine.py.
+                        if hasattr(engine, "num_io_tensors"):
+                            return int(engine.num_io_tensors) // profiles
+
+                        raise AttributeError(
+                            "Could not determine TensorRT bindings per profile: "
+                            "engine has neither num_bindings nor num_io_tensors"
+                        )
+
+                    trt_util.get_bindings_per_profile = _sd_get_bindings_per_profile
+                    print("[TRT Compat] Patched polygraphy.backend.trt.util.get_bindings_per_profile")
+                # ---- TensorRT 10.x API Compatibility Shim ----
+                import tensorrt as trt
+                
+                # 1. Patch ICudaEngine
+                if not hasattr(trt.ICudaEngine, "get_binding_dtype"):
+                    print("[TRT Compat] Patching TensorRT 10.x ICudaEngine API...")
+                    
+                    def _get_name(self, idx):
+                        return idx if isinstance(idx, str) else self.get_tensor_name(idx)
+                        
+                    def _get_shape(self, idx):
+                        name = idx if isinstance(idx, str) else self.get_tensor_name(idx)
+                        return self.get_tensor_shape(name)
+                        
+                    def _get_dtype(self, idx):
+                        name = idx if isinstance(idx, str) else self.get_tensor_name(idx)
+                        return self.get_tensor_dtype(name)
+                        
+                    def _is_input(self, idx):
+                        name = idx if isinstance(idx, str) else self.get_tensor_name(idx)
+                        return self.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+                    
+                    trt.ICudaEngine.num_bindings = property(lambda self: getattr(self, "num_io_tensors", 0))
+                    trt.ICudaEngine.get_binding_name = _get_name
+                    trt.ICudaEngine.get_binding_shape = _get_shape
+                    trt.ICudaEngine.get_binding_dtype = _get_dtype
+                    trt.ICudaEngine.binding_is_input = _is_input
+                    
+                    # Handle index brackets and legacy attributes
+                    trt.ICudaEngine.has_implicit_batch_dimension = False
+                    trt.ICudaEngine.__getitem__ = lambda self, idx: idx if isinstance(idx, str) else self.get_tensor_name(idx)
+                    trt.ICudaEngine.__len__ = lambda self: getattr(self, "num_io_tensors", 0)
+
+                # 2. Patch IExecutionContext
+                if not hasattr(trt.IExecutionContext, "set_binding_shape"):
+                    print("[TRT Compat] Patching TensorRT 10.x IExecutionContext API...")
+                    
+                    def _set_shape(self, idx, shape):
+                        name = idx if isinstance(idx, str) else self.engine.get_tensor_name(idx)
+                        return self.set_input_shape(name, shape)
+                        
+                    def _get_ctx_shape(self, idx):
+                        name = idx if isinstance(idx, str) else self.engine.get_tensor_name(idx)
+                        return self.get_tensor_shape(name)
+                    
+                    # Translate Legacy V2 compute calls into Modern V3 compute calls
+                    def _execute_async_v2(self, bindings, stream_handle):
+                        for i, ptr in enumerate(bindings):
+                            if ptr: # Safely map memory addresses natively
+                                name = self.engine.get_tensor_name(i)
+                                self.set_tensor_address(name, ptr)
+                        return self.execute_async_v3(stream_handle)
+                        
+                    trt.IExecutionContext.set_binding_shape = _set_shape
+                    trt.IExecutionContext.get_binding_shape = _get_ctx_shape
+                    
+                    if not hasattr(trt.IExecutionContext, "execute_async_v2"):
+                        trt.IExecutionContext.execute_async_v2 = _execute_async_v2
+                # ----------------------------------------------
                 from streamdiffusion.acceleration.tensorrt import (
                     TorchVAEEncoder,
                     compile_unet,
