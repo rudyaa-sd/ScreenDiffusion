@@ -391,7 +391,7 @@ def _frame_to_rgb(frame: np.ndarray, force_swap_rb: Optional[bool] = False) -> n
 SHOW = {
     "model_path": True, "prompt": True, "negative_prompt": True, "seed": True,
     "frame_buffer_size": False, "acceleration": True, "use_denoising_batch": False,
-    "cfg_type": True, "guidance_scale": True, "delta": True, "similar_image_filter": True,
+    "cfg_type": False, "guidance_scale": False, "delta": False, "similar_image_filter": False,
     "offline": False,
 }
 
@@ -655,28 +655,49 @@ def image_generation_process(out_queue: Queue, fps_queue: Queue, close_queue: Qu
                     elif mtype == "set_t_index_list":
                         new_t = msg.get("t_index_list")
                         if isinstance(new_t, (list, tuple)) and len(new_t) > 0:
-                            current_t_index_list = [int(max(2, min(49, x))) for x in new_t]
-                            stream.set_t_index_list(current_t_index_list)
+                            new_t_clean = [int(max(2, min(49, x))) for x in new_t]
+                            
+                            # Check if the NUMBER of steps changed (Requires Engine Swap)
+                            if len(new_t_clean) != len(current_t_index_list):
+                                _status(f"Swapping engine for {len(new_t_clean)} steps...")
+                                current_t_index_list = new_t_clean
+                                
+                                # Flush current engine from VRAM
+                                del stream
+                                import gc; gc.collect(); import_torch.cuda.empty_cache()
+                                
+                                # Re-instantiate the wrapper to load the correct TensorRT engine
+                                stream = StreamDiffusionWrapper(
+                                    model_id_or_path=model_path_dir, 
+                                    t_index_list=list(current_t_index_list), 
+                                    frame_buffer_size=frame_buffer_size, width=width, height=height, 
+                                    warmup=2, acceleration=acceleration, do_add_noise=do_add_noise, 
+                                    enable_similar_image_filter=enable_similar_image_filter, 
+                                    similar_image_filter_threshold=similar_image_filter_threshold, 
+                                    similar_image_filter_max_skip_frame=similar_image_filter_max_skip_frame, 
+                                    mode="img2img", use_denoising_batch=use_denoising_batch, 
+                                    cfg_type=cfg_type, seed=seed, lora_dict=lora_dict
+                                )
+                                stream.prepare(prompt=prompt, negative_prompt=negative_prompt, num_inference_steps=50, guidance_scale=guidance_scale, delta=delta)
+                                _status("Engine swap complete!")
+                            else:
+                                # Length is the same (Slider was dragged). Update values instantly!
+                                current_t_index_list = new_t_clean
+                                stream.set_t_index_list(current_t_index_list)
                     elif mtype == "set_prompt":
                         prompt = str(msg.get("prompt", prompt))
                         try:
-                            stream.update_prompt(prompt, negative_prompt=negative_prompt)
+                            stream.stream.update_prompt(prompt)
                         except Exception:
-                            stream.prepare(prompt=prompt, negative_prompt=negative_prompt, num_inference_steps=50, guidance_scale=guidance_scale, delta=delta)
-                            stream.set_t_index_list(current_t_index_list)
+                            pass
                     elif mtype == "set_negative_prompt":
                         negative_prompt = str(msg.get("negative_prompt", negative_prompt))
                         try:
-                            stream.update_prompt(prompt, negative_prompt=negative_prompt)
+                            stream.stream.update_prompt(prompt)
                         except Exception:
-                            stream.prepare(prompt=prompt, negative_prompt=negative_prompt, num_inference_steps=50, guidance_scale=guidance_scale, delta=delta)
-                            stream.set_t_index_list(current_t_index_list)
+                            pass
             except Exception:
                 pass
-
-            if len(inputs) < frame_buffer_size:
-                time.sleep(0.004)
-                continue
 
             try:
                 t0 = time.time()
@@ -982,7 +1003,13 @@ class StreamGUI(ctk.CTk):
             try: float(P); return True
             except ValueError: return False
         vcmd = (self.register(validate_numeric_input), '%P')
-        numeric_entries = [self._w_seed_entry, self._w_guidance_entry, self._w_delta_entry, self._w_sim_thresh, self._w_sim_maxskip]
+        numeric_entries = [
+            getattr(self, '_w_seed_entry', None),
+            getattr(self, '_w_guidance_entry', None),
+            getattr(self, '_w_delta_entry', None),
+            getattr(self, '_w_sim_thresh', None),
+            getattr(self, '_w_sim_maxskip', None),
+        ]
         for entry in numeric_entries:
             if entry: entry.configure(validate="key", validatecommand=vcmd)
 
@@ -1312,38 +1339,56 @@ class StreamGUI(ctk.CTk):
             self._w_denoise_switch.grid(row=1, column=col, sticky="w"); col += 1
             self._register_lockables(self._w_denoise_switch)
         row += 1
-        g3 = ctk.CTkFrame(left); g3.grid(row=row, column=0, sticky="ew", pady=(4,6))
+        g3 = ctk.CTkFrame(left); g3.grid(row=row, column=0, sticky="ew", pady=(4,6)); g3.grid_remove()
         for i in range(6): g3.grid_columnconfigure(i, weight=1)
         col = 0
-        if SHOW.get("cfg_type", True):
+        if SHOW.get("cfg_type", False):
             ctk.CTkLabel(g3, text="CFG type").grid(row=0, column=col, sticky="w")
             self._w_cfg_combo = ctk.CTkComboBox(g3, values=["none","full","self","initialize"], variable=self.cfg_type_var, width=120)
             self._w_cfg_combo.grid(row=1, column=col, sticky="ew"); col += 1
             self._register_lockables(self._w_cfg_combo)
-        if SHOW.get("guidance_scale", True):
+        if SHOW.get("guidance_scale", False):
             ctk.CTkLabel(g3, text="Guidance").grid(row=0, column=col, sticky="w")
             self._w_guidance_entry = ctk.CTkEntry(g3, textvariable=self.guidance_var, width=70)
             self._w_guidance_entry.grid(row=1, column=col, sticky="ew"); col += 1
             self._register_lockables(self._w_guidance_entry)
-        if SHOW.get("delta", True):
+        if SHOW.get("delta", False):
             ctk.CTkLabel(g3, text="Delta").grid(row=0, column=col, sticky="w")
             self._w_delta_entry = ctk.CTkEntry(g3, textvariable=self.delta_var, width=70)
             self._w_delta_entry.grid(row=1, column=col, sticky="ew"); col += 1
             self._register_lockables(self._w_delta_entry)
-        if SHOW.get("offline", True):
+        if SHOW.get("offline", False):
             self._w_offline_switch = ctk.CTkSwitch(g3, text="Offline", variable=self.offline_var)
             self._w_offline_switch.grid(row=1, column=col, sticky="w"); col += 1
             self._register_lockables(self._w_offline_switch)
         row += 1
-        self.left_panel = left
-        steps = ctk.CTkFrame(left); steps.grid(row=row, column=0, sticky="ew", pady=(4,6))
-        steps.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(steps, text="Denoising Step", anchor="w").grid(row=0, column=0, sticky="w", pady=(0,4))
-        self._steps_holder = ctk.CTkFrame(steps)
-        self._steps_holder.grid(row=1, column=0, sticky="ew", pady=(6,0))
+        # --- SECTION 3: Step Sliders (Bottom - Takes up remaining space) ---
+        steps_frame = ctk.CTkFrame(left, fg_color="transparent")
+        # FIX: Use .grid() here to match g3 and sim!
+        steps_frame.grid(row=row, column=0, sticky="nsew", padx=10, pady=10) 
+
+        # Header row for the title and the buttons (These can use pack because they are INSIDE steps_frame)
+        step_header = ctk.CTkFrame(steps_frame, fg_color="transparent")
+        step_header.pack(fill="x", pady=(0, 5))
+
+        ctk.CTkLabel(step_header, text="Denoising Steps", font=ctk.CTkFont(weight="bold")).pack(side="left")
+
+        # Add Step Button
+        btn_add = ctk.CTkButton(step_header, text="+ Add", width=50, command=self._add_step)
+        btn_add.pack(side="right", padx=(5,0))
+        self._register_lockables(btn_add)
+
+        # Remove Step Button
+        btn_rm = ctk.CTkButton(step_header, text="- Remove", width=60, command=self._remove_step)
+        btn_rm.pack(side="right")
+        self._register_lockables(btn_rm)
+
+        # Container for the dynamic sliders
+        self._steps_holder = ctk.CTkFrame(steps_frame)
+        self._steps_holder.pack(fill="both", expand=True, pady=5)
         self._build_steps_ui()
         row += 1
-        if SHOW.get("similar_image_filter", True):
+        if SHOW.get("similar_image_filter", False):
             sim = ctk.CTkFrame(left); sim.grid(row=row, column=0, sticky="ew", pady=(4,6))
             sim.grid_columnconfigure(0, weight=0); sim.grid_columnconfigure(1, weight=1)
             ctk.CTkLabel(sim, text="Similar Image Filter").grid(row=0, column=0, sticky="w", pady=(0,4))
@@ -1467,8 +1512,15 @@ class StreamGUI(ctk.CTk):
 
     def _add_step(self):
         if self.running: return
-        self.t_index_list.append(30)
+        # Automatically make the new step 10 less than the last one to prevent duplicates
+        last_val = self.t_index_list[-1] if self.t_index_list else 40
+        new_val = max(2, last_val - 10)
+        
+        self.t_index_list.append(new_val)
         self._build_steps_ui()
+        if self.running: 
+            try: self.control_q.put_nowait({"type": "set_t_index_list", "t_index_list": list(self.t_index_list)})
+            except Exception: pass
 
     def _remove_step(self):
         if len(self.t_index_list) > 1:
@@ -1494,14 +1546,25 @@ class StreamGUI(ctk.CTk):
         self._apply_running_state()
 
     def _on_step_changed(self, index: int, v, disp_var):
-        try: ival = max(2, min(49, int(float(v))))
-        except Exception: return
+        try:
+            ival = max(2, min(49, int(float(v))))
+        except Exception:
+            return
+    
         disp_var.set(str(ival))
+    
+        # Update just the value that changed — no sorting, no reordering
         if 0 <= index < len(self.t_index_list):
             self.t_index_list[index] = ival
+
         if self.running and getattr(self, 'control_q', None):
-            try: self.control_q.put_nowait({"type": "set_t_at", "index": int(index), "value": int(ival)})
-            except Exception: pass
+            try:
+                self.control_q.put_nowait({
+                    "type": "set_t_index_list",
+                    "t_index_list": list(self.t_index_list)
+                })
+            except Exception:
+                pass
 
     def _on_prompt_changed(self, _evt=None):
         if not self.running: return
@@ -1636,7 +1699,16 @@ class StreamGUI(ctk.CTk):
         controlnet_paths: List[str] = []; controlnet_scales: List[float] = []
         self.proc_worker = ctx.Process(
             target=image_generation_process,
-            args=(self.out_q, self.fps_q, self.close_q, self.status_q, self.control_q, self.debug_q, list(map(int, self.t_index_list)), self.model_var.get(), controlnet_paths, controlnet_scales, None, self.prompt_txt.get("1.0", "end").strip(), self.neg_prompt_txt.get("1.0", "end").strip(), int(self.buffer_var.get()), int(self.width_var.get()), int(self.height_var.get()), self.accel_var.get(), bool(self.denoise_batch_var.get()), int(self.seed_var.get()), self.cfg_type_var.get(), float(self.guidance_var.get()), float(self.delta_var.get()), False, bool(self.sim_filter_var.get()), float(self.sim_thresh_var.get()), float(self.sim_maxskip_var.get()), self.monitor_receiver, bool(self.offline_var.get()),)
+            args=(
+                self.out_q, self.fps_q, self.close_q, self.status_q, self.control_q, self.debug_q, 
+                list(map(int, self.t_index_list)), self.model_var.get(), controlnet_paths, controlnet_scales, 
+                None, 
+                self.prompt_txt.get("1.0", "end").strip(), self.neg_prompt_txt.get("1.0", "end").strip(), 
+                int(self.buffer_var.get()), int(self.width_var.get()), int(self.height_var.get()), 
+                self.accel_var.get(), True, int(self.seed_var.get()), 
+                "none", 0.0, 0.5, True, False, 0.99, 10.0,  # <-- Changed the first 'False' to 'True' here!
+                self.monitor_receiver, True
+            )
         )
         self.proc_worker.start()
         self.capwin = FloatingCaptureWindow(self, inner_size=self.preview_dim, border_px=8, handle_h=28)
