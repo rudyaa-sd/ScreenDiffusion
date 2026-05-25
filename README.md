@@ -1,4 +1,4 @@
-Screen Diffusion V0.2 ( to be released in a few days )
+Screen Diffusion V0.2
 A real-time AI transformation tool.
 
 ![ScreenDiffusion demo](media/SD-1.gif)
