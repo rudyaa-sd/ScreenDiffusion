@@ -146,9 +146,9 @@ def _prime_dll_search():
     print("[DLL Search] Priming DLL search paths...")
     
     dll_packages = [
-        "torch",
         "tensorrt",
         "xformers",
+        "torch",
     ]
     
     for package in dll_packages:
@@ -2805,7 +2805,9 @@ class StreamGUI(ctk.CTk):
                     msg = self.status_q.get_nowait()
                     self.status_var.set(msg)
             except Exception: pass
-        self.after(33, self._poll_queues)
+        # Dynamic polling: Uncapped for TensorRT, CPU-friendly for PyTorch
+        poll_delay = 10 if self.accel_var.get() == "tensorrt" else 33
+        self.after(poll_delay, self._poll_queues)
 
     def _update_preview(self, pil_img: Image):
         dim = self.preview_dim

@@ -22,6 +22,7 @@ from streamdiffusion.image_utils import postprocess_image
 torch.set_grad_enabled(False)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True  # Add this flag
 
 
 def _broadcast_list(vals: Optional[List[float]], n: int, default: float = 1.0) -> List[float]:
@@ -228,6 +229,11 @@ class StreamDiffusionWrapper:
         a native setter, use it; otherwise patch step-dependent caches.
         """
         new_steps = [int(max(1, min(49, int(v)))) for v in list(new_steps)]
+        
+        # Stop redundant rebuilds from slider spam!
+        if hasattr(self, 't_index_list') and self.t_index_list == new_steps:
+            return 
+            
         self.t_index_list = list(new_steps)
     
         # Try native methods first
