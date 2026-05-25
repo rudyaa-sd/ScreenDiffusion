@@ -20,6 +20,8 @@ This project is completely free for everyone to use and explore.
   - Use Screen Diffusion to download the Sd-Turbo model
      Or
      Download SD-Turbo Model and store it locally - (download link) https://huggingface.co/stabilityai/sd-turbo/tree/main
+  - Supports RTX 30, 40, and 50 series
+  - TensorRT support
 
 📦 Installation
 
