@@ -15,9 +15,9 @@ This project is completely free for everyone to use and explore.
 
   - Windows 11 / Windows 10
   - NVIDIA GPU with 8GB+ VRAM (RTX 3080 or higher recommended)
-  -Python 3.11.8 (download) https://www.python.org/downloads/release/python-3118/
-  ( Click on "Ad Python 3.11.8 to PATH" when installing).
-  -Use Screen Diffusion to download the Sd-Turbo model
+  - Python 3.11.8 (download) https://www.python.org/downloads/release/python-3118/
+  ( Click on "Ad Python 3.11.8 to PATH" when installing)
+  - Use Screen Diffusion to download the Sd-Turbo model
      Or
      Download SD-Turbo Model and store it locally - (download link) https://huggingface.co/stabilityai/sd-turbo/tree/main
 
