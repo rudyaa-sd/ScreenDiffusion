@@ -1303,6 +1303,7 @@ class StreamGUI(ctk.CTk):
         left = ctk.CTkScrollableFrame(self, width=440, corner_radius=12)
         left.grid(row=1, column=0, sticky="nsew", padx=(12, 0), pady=(6, 6))
         left.grid_columnconfigure(0, weight=1)
+        self.left_panel = left
         row = 0
         if SHOW.get("model_path", True):
             ctk.CTkLabel(left, text="Model (diffusers folder):", anchor="w").grid(row=row, column=0, sticky="ew", pady=(4, 0))
