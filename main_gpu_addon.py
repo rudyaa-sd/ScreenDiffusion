@@ -1159,7 +1159,7 @@ class StreamGUI(ctk.CTk):
                                                 import time, os, urllib.request
                                                 try:
                                                     req = urllib.request.Request(dl_url, method='HEAD', headers={'User-Agent': 'Mozilla/5.0'})
-                                                    with urllib.request.urlopen(req) as response:
+                                                    with urllib.request.urlopen(req, timeout=30) as response:
                                                         total_size = int(response.headers.get('Content-Length', 0))
                                                     if total_size > 0:
                                                         while not check_cancelled():
